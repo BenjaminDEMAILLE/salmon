@@ -14,9 +14,10 @@ use wgpu::util::DeviceExt;
 
 use crate::reference::{banded_extz_score_dna5, BandedParams};
 
-/// Target lengths above this are scored on the CPU (the kernel keeps per-target
-/// rows in private memory, capped here). Must match `MAX_T` in the shader.
-const MAX_T: usize = 384;
+/// Bandwidths above this are scored on the CPU reference: the kernel stores each
+/// DP row's band in fixed-size private arrays sized for this maximum. Must match
+/// `MAX_W` in the shader. (salmon's default `--dpBandwidth` is 15.)
+const MAX_W: i32 = 40;
 
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -115,13 +116,21 @@ impl GpuContext {
     }
 
     /// Score a batch of alignments on the GPU. Result `i` corresponds to task
-    /// `i`. Tasks whose target exceeds [`MAX_T`] are scored on the CPU reference
-    /// (same algorithm), so the output is always complete and bit-identical to
-    /// the reference regardless of length.
+    /// `i`. When the bandwidth exceeds [`MAX_W`] the whole batch is scored on the
+    /// CPU reference (same algorithm), so the output is always complete and
+    /// bit-identical to the reference.
     pub fn batch_align(&self, tasks: &[GpuTask], p: &BandedParams) -> Vec<i32> {
         let n = tasks.len();
         if n == 0 {
             return Vec::new();
+        }
+        // The kernel's band storage is sized for bandwidths up to MAX_W; wider
+        // bands (rare; salmon's default is 15) are scored on the CPU reference.
+        if p.bandwidth > MAX_W {
+            return tasks
+                .iter()
+                .map(|t| banded_extz_score_dna5(t.query5, t.target5, p))
+                .collect();
         }
 
         // Pack queries and targets into flat one-base-per-u32 buffers, recording
@@ -250,16 +259,8 @@ impl GpuContext {
         });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().expect("map_async channel").expect("map failed");
-        let mut scores: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let scores: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         readback.unmap();
-
-        // Tasks whose target exceeded MAX_T were skipped by the kernel; score
-        // them on the CPU reference (identical algorithm).
-        for (i, t) in tasks.iter().enumerate() {
-            if t.target5.len() > MAX_T {
-                scores[i] = banded_extz_score_dna5(t.query5, t.target5, p);
-            }
-        }
         scores
     }
 }
