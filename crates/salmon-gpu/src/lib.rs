@@ -14,12 +14,16 @@
 //! reproduces the CPU path bit-for-bit, preserving salmon's guarantee of
 //! identical output regardless of where the work runs.
 
+pub mod aligner;
 pub mod reference;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+pub use aligner::RefAligner;
 pub use reference::{banded_extz_score, banded_extz_score_dna5, dna5, BandedParams, NEG_INF};
 
+#[cfg(feature = "gpu")]
+pub use aligner::GpuAligner;
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuContext, GpuTask};

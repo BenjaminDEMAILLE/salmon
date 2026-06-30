@@ -27,8 +27,8 @@ pub mod score;
 pub mod sketch;
 
 pub use align::{
-    align_chain, align_in_window, perfect_score, AlignConfig, Alignment, Aligner, AlignTask,
-    CpuAligner,
+    align_chain, align_in_window, full_length_window, min_accepted_score, perfect_score,
+    AlignConfig, Alignment, Aligner, AlignTask, CpuAligner,
 };
 pub use chain::{chain_mems, ChainConfig, MemChain};
 pub use collect::{
