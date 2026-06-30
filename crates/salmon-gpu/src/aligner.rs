@@ -11,7 +11,9 @@
 //! They always score full-length regardless of [`AlignConfig::full_length_alignment`];
 //! the GPU path is only wired in when full-length mode is in effect.
 
-use salmon_map::{full_length_window, min_accepted_score, AlignConfig, AlignTask, Aligner, Alignment};
+use salmon_map::{
+    full_length_window, min_accepted_score, AlignConfig, AlignTask, Aligner, Alignment,
+};
 
 use crate::reference::{banded_extz_score_dna5, dna5, BandedParams};
 
@@ -127,7 +129,7 @@ mod gpu_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use salmon_map::{AlignConfig, CpuAligner, MemChain, Mem};
+    use salmon_map::{AlignConfig, CpuAligner, Mem, MemChain};
 
     fn gen_seq(n: usize, seed: u64) -> Vec<u8> {
         const B: [u8; 4] = *b"ACGT";
@@ -217,7 +219,11 @@ mod tests {
             if k % 5 == 0 && r.len() > 40 {
                 r.drain(30..33); // small deletion
             }
-            chains.push(MemChain::new(vec![Mem::new(0, start as i32, 31)], 31.0, true));
+            chains.push(MemChain::new(
+                vec![Mem::new(0, start as i32, 31)],
+                31.0,
+                true,
+            ));
             reads.push(r);
         }
         let cfg = full_length_cfg();

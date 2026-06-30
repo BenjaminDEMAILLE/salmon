@@ -113,13 +113,7 @@ fn min_accepted(qlen: usize) -> i32 {
 /// deems acceptable (or within a small slack of the threshold) the scores are
 /// bit-identical. They may differ only on the magnitude of deeply sub-threshold
 /// scores, which never enter an equivalence class, so quant output is unaffected.
-fn check(
-    mism: &mut Vec<Mismatch>,
-    scenario: &'static str,
-    query: &[u8],
-    target: &[u8],
-    w: i32,
-) {
+fn check(mism: &mut Vec<Mismatch>, scenario: &'static str, query: &[u8], target: &[u8], w: i32) {
     let p = params(w);
     let got = banded_extz_score(query, target, &p);
     let want = ksw_score(query, target, w);
@@ -158,7 +152,7 @@ fn reference_matches_ksw2_over_corpus() {
 
     for _ in 0..4000 {
         let qlen = 40 + rng.below(120); // 40..=159
-        // Build a reference window the read aligns into at offset 0.
+                                        // Build a reference window the read aligns into at offset 0.
         let target = rand_seq(&mut rng, qlen + margin);
         let mut query: Vec<u8> = target[..qlen].to_vec();
 

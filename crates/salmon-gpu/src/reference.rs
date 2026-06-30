@@ -144,11 +144,7 @@ fn run_dp(q5: &[u8], t5: &[u8], p: &BandedParams) -> i32 {
     for iq in 0..qn {
         // Virtual column it = -1: an all-insertion path from the origin.
         // Diagonal source for it = 0 is H(iq-1, -1) (the origin when iq == 0).
-        let mut diag_src = if iq == 0 {
-            0
-        } else {
-            -(go + iq as i32 * ge)
-        };
+        let mut diag_src = if iq == 0 { 0 } else { -(go + iq as i32 * ge) };
         let mut h_left = -(go + (iq as i32 + 1) * ge); // H(iq, it-1), seeded at H(iq,-1)
         let mut e_run = NEG_INF; // E at it = -1 is unreachable
 
@@ -169,7 +165,11 @@ fn run_dp(q5: &[u8], t5: &[u8], p: &BandedParams) -> i32 {
             }
 
             let s = sub_score(q5[iq], t5[it], p);
-            let m = if diag <= NEG_INF / 2 { NEG_INF } else { diag + s };
+            let m = if diag <= NEG_INF / 2 {
+                NEG_INF
+            } else {
+                diag + s
+            };
 
             // E: gap in query (consume target), from the left neighbour.
             e_run = sat_sub(h_left, go + ge).max(sat_sub(e_run, ge));

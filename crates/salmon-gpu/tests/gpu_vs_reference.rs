@@ -116,6 +116,9 @@ fn gpu_matches_reference_over_corpus() {
                 mismatches += 1;
             }
         }
-        assert_eq!(mismatches, 0, "{mismatches} GPU/reference mismatches at w={w}");
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches} GPU/reference mismatches at w={w}"
+        );
     }
 }

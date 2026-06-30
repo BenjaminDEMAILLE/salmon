@@ -80,17 +80,16 @@ impl GpuContext {
             source: wgpu::ShaderSource::Wgsl(include_str!("banded_dp.wgsl").into()),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("banded_dp bgl"),
-                entries: &[
-                    uniform_entry(0),
-                    storage_entry(1, true),
-                    storage_entry(2, true),
-                    storage_entry(3, true),
-                    storage_entry(4, false),
-                ],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("banded_dp bgl"),
+            entries: &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, true),
+                storage_entry(4, false),
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("banded_dp layout"),
