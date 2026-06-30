@@ -11,7 +11,9 @@ use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::hit_searcher::HitSearcher;
 use salmon_core::{LibraryFormat, MateStatus, ReadOrientation, ReadStrandedness, ReadType};
 
-use crate::align::{align_chain, align_in_window, revcomp, AlignConfig};
+use crate::align::{
+    align_chain, align_in_window, revcomp, AlignConfig, AlignTask, Aligner, Alignment, CpuAligner,
+};
 use crate::collect::{
     best_per_target, collect_read_mems, consensus_filter, MappingCandidate, MemCollectorConfig,
 };
@@ -116,10 +118,22 @@ pub fn map_single_read<'idx, R: RefProvider>(
         cfg.collect.consensus_fraction,
     );
     let had_candidates = !cands.is_empty();
+    // Collect one validation task per candidate, then score them as a batch.
+    // The CPU backend scores in place, so this is identical to aligning each
+    // candidate inline; a batched backend fuses them into one dispatch.
+    let tasks: Vec<AlignTask> = cands
+        .iter()
+        .map(|c| AlignTask {
+            read,
+            ref_seq: refs.ref_seq(c.tid),
+            chain: &c.chain,
+        })
+        .collect();
+    let alns = CpuAligner.align_batch(&tasks, &cfg.align);
     let mut below = 0u32;
     let mut raw = Vec::with_capacity(cands.len());
-    for c in cands {
-        if let Some(aln) = align_chain(read, refs.ref_seq(c.tid), &c.chain, &cfg.align) {
+    for (c, aln) in cands.iter().zip(&alns) {
+        if let Some(aln) = aln {
             if aln.valid {
                 // single-end observed strandedness: sense if forward, else antisense
                 let strand = if c.is_fw {
@@ -204,16 +218,53 @@ pub fn map_read_pair<'idx, R: RefProvider>(
         .iter()
         .any(|j| matches!(j.status, MateStatus::PairedEndPaired));
     let dovetail = crate::pair::dovetail_rejected() && !has_concordant_pair;
+    // Collect the validation tasks in joint order: a concordant pair aligns
+    // both mates (left then right), an orphan aligns its anchor, SingleEnd
+    // aligns nothing. The consume loop below walks the joints in the same order
+    // so result `i` lines up with the task that produced it — identical to the
+    // previous inline align order (and so to its thread-local alignment cache).
+    let mut tasks: Vec<AlignTask> = Vec::new();
+    for j in &joints {
+        match j.status {
+            MateStatus::PairedEndPaired => {
+                let refseq = refs.ref_seq(j.tid);
+                tasks.push(AlignTask {
+                    read: r1,
+                    ref_seq: refseq,
+                    chain: &j.left.as_ref().unwrap().chain,
+                });
+                tasks.push(AlignTask {
+                    read: r2,
+                    ref_seq: refseq,
+                    chain: &j.right.as_ref().unwrap().chain,
+                });
+            }
+            MateStatus::PairedEndLeft => tasks.push(AlignTask {
+                read: r1,
+                ref_seq: refs.ref_seq(j.tid),
+                chain: &j.left.as_ref().unwrap().chain,
+            }),
+            MateStatus::PairedEndRight => tasks.push(AlignTask {
+                read: r2,
+                ref_seq: refs.ref_seq(j.tid),
+                chain: &j.right.as_ref().unwrap().chain,
+            }),
+            MateStatus::SingleEnd => {}
+        }
+    }
+    let alns = CpuAligner.align_batch(&tasks, &cfg.align);
+
     let mut below = 0u32;
     let mut raw = Vec::new();
-    for j in joints {
+    let mut ri = 0usize;
+    for j in &joints {
         match j.status {
             MateStatus::PairedEndPaired => {
                 let l = j.left.as_ref().unwrap();
                 let r = j.right.as_ref().unwrap();
-                let refseq = refs.ref_seq(j.tid);
-                let al = align_chain(r1, refseq, &l.chain, &cfg.align);
-                let ar = align_chain(r2, refseq, &r.chain, &cfg.align);
+                let al = alns[ri];
+                let ar = alns[ri + 1];
+                ri += 2;
                 if let (Some(al), Some(ar)) = (al, ar) {
                     if al.valid && ar.valid {
                         // positional bias (salmon's PAIRED_END_PAIRED case): only
@@ -282,6 +333,8 @@ pub fn map_read_pair<'idx, R: RefProvider>(
             }
             MateStatus::PairedEndLeft => {
                 let anchor = j.left.as_ref().unwrap();
+                let anchor_aln = alns[ri];
+                ri += 1;
                 push_orphan_or_recovered(
                     &mut raw,
                     index_seq(refs, j.tid),
@@ -292,10 +345,13 @@ pub fn map_read_pair<'idx, R: RefProvider>(
                     refs,
                     cfg,
                     j.tid,
+                    anchor_aln,
                 );
             }
             MateStatus::PairedEndRight => {
                 let anchor = j.right.as_ref().unwrap();
+                let anchor_aln = alns[ri];
+                ri += 1;
                 push_orphan_or_recovered(
                     &mut raw,
                     index_seq(refs, j.tid),
@@ -306,6 +362,7 @@ pub fn map_read_pair<'idx, R: RefProvider>(
                     refs,
                     cfg,
                     j.tid,
+                    anchor_aln,
                 );
             }
             MateStatus::SingleEnd => {}
@@ -443,8 +500,9 @@ fn push_orphan_or_recovered<R: RefProvider>(
     refs: &R,
     cfg: &MapConfig,
     tid: u32,
+    anchor_aln: Option<Alignment>,
 ) {
-    let Some(anchor_aln) = align_chain(anchor_read, refseq, &anchor.chain, &cfg.align) else {
+    let Some(anchor_aln) = anchor_aln else {
         return;
     };
     if !anchor_aln.valid {

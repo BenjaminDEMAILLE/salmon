@@ -154,6 +154,47 @@ pub fn align_chain(
     })
 }
 
+/// One candidate-validation request for an [`Aligner`]: align `read` against
+/// `ref_seq` along `chain`. The read is supplied in its natural orientation;
+/// `chain.is_fw` selects whether the read or its reverse complement is the query
+/// (see [`align_chain`]). Borrowing keeps task collection allocation-free on the
+/// hot path; every referent (read bytes, reference sequence, chain) outlives the
+/// batch it is collected into.
+#[derive(Clone, Copy)]
+pub struct AlignTask<'a> {
+    pub read: &'a [u8],
+    pub ref_seq: &'a [u8],
+    pub chain: &'a MemChain,
+}
+
+/// A backend that validates mapping candidates by alignment. The mapper collects
+/// the candidates a fragment (or, for a batched backend, a whole mini-batch)
+/// needs aligned, hands them to [`align_batch`](Aligner::align_batch), and
+/// consumes the scores: result `i` corresponds to task `i`, with `None`
+/// mirroring [`align_chain`] returning `None` (no usable window). Decoupling
+/// collection from scoring is what lets a GPU backend fuse thousands of
+/// independent banded DPs into one dispatch, while the CPU backend simply scores
+/// them in place. The alignment scores are integer-valued, so a faithful backend
+/// reproduces [`CpuAligner`] bit-for-bit and preserves salmon's determinism.
+pub trait Aligner {
+    fn align_batch(&self, tasks: &[AlignTask], cfg: &AlignConfig) -> Vec<Option<Alignment>>;
+}
+
+/// The in-place CPU backend: score-for-score identical to calling [`align_chain`]
+/// on each task (it is exactly that). The default backend and the reference
+/// semantics every other backend must reproduce.
+pub struct CpuAligner;
+
+impl Aligner for CpuAligner {
+    #[inline]
+    fn align_batch(&self, tasks: &[AlignTask], cfg: &AlignConfig) -> Vec<Option<Alignment>> {
+        tasks
+            .iter()
+            .map(|t| align_chain(t.read, t.ref_seq, t.chain, cfg))
+            .collect()
+    }
+}
+
 thread_local! {
     /// Per-thread cache of gap/flank DP scores, keyed by the exact (query, ref)
     /// substring pair — salmon's alignment cache, to avoid re-running identical
@@ -782,6 +823,42 @@ mod tests {
             "unrelated read should not validate (score {})",
             aln.score
         );
+    }
+
+    #[test]
+    fn cpu_aligner_batch_matches_align_chain() {
+        // The CpuAligner is the reference backend: align_batch must equal calling
+        // align_chain on each task, in order (this is the contract every other
+        // backend has to reproduce bit-for-bit).
+        let reference = gen_seq(400, 31);
+        let exact = reference[50..130].to_vec(); // exact match
+        let mut mutated = reference[140..220].to_vec(); // one mismatch
+        let mid = mutated.len() / 2;
+        mutated[mid] = if mutated[mid] == b'A' { b'C' } else { b'A' };
+        let foreign = gen_seq(80, 4242); // unrelated
+        let chains = [fw_chain(50, 31), fw_chain(140, 31), fw_chain(50, 31)];
+        let reads = [&exact, &mutated, &foreign];
+        let cfg = AlignConfig::default();
+
+        let tasks: Vec<AlignTask> = reads
+            .iter()
+            .zip(&chains)
+            .map(|(read, chain)| AlignTask {
+                read,
+                ref_seq: &reference,
+                chain,
+            })
+            .collect();
+        let batched = CpuAligner.align_batch(&tasks, &cfg);
+
+        assert_eq!(batched.len(), reads.len());
+        for ((read, chain), got) in reads.iter().zip(&chains).zip(&batched) {
+            let want = align_chain(read, &reference, chain, &cfg);
+            assert_eq!(*got, want, "batch result must match per-task align_chain");
+        }
+        // sanity: exact validates, foreign does not
+        assert!(batched[0].unwrap().valid);
+        assert!(!batched[2].unwrap().valid);
     }
 
     #[test]
