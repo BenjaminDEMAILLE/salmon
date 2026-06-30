@@ -16,4 +16,10 @@
 
 pub mod reference;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 pub use reference::{banded_extz_score, banded_extz_score_dna5, dna5, BandedParams, NEG_INF};
+
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuContext, GpuTask};
