@@ -28,7 +28,7 @@ pub mod sketch;
 
 pub use align::{
     align_chain, align_in_window, full_length_window, min_accepted_score, perfect_score,
-    AlignConfig, Alignment, Aligner, AlignTask, CpuAligner,
+    AlignConfig, AlignTask, Aligner, Alignment, CpuAligner,
 };
 pub use chain::{chain_mems, ChainConfig, MemChain};
 pub use collect::{
@@ -40,8 +40,8 @@ pub use extend::{
     collect_read_true_unimems, collect_read_unimems, extend_mem, extend_mem_within,
 };
 pub use mapper::{
-    debug_best_mapping, map_read_pair, map_single_read, take_last_map_stats, DebugMapping,
-    MapConfig, MapStats, SeedMode,
+    collect_pair, debug_best_mapping, map_read_pair, map_single_read, take_last_map_stats,
+    DebugMapping, MapConfig, MapStats, PendingPair, SeedMode,
 };
 pub use mem::Mem;
 pub use pair::{join_reads_and_filter, JointMapping, PairingConfig};
