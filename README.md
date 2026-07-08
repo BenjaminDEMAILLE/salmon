@@ -43,6 +43,9 @@ cargo install salmon-cli
 # or via conda
 conda install -c bioconda -c conda-forge salmon
 
+# or via Homebrew (macOS & Linux)
+brew install salmon
+
 # or Docker
 docker run --rm combinelab/salmon:latest salmon --version
 ```
