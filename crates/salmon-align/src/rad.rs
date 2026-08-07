@@ -250,7 +250,6 @@ impl RadScratch {
     fn group_tid(&self, g: usize) -> u32 {
         self.pairs[self.order[self.group_start[g] as usize] as usize].0
     }
-
 }
 
 /// Best-effort observed library format for a RAD placement (proper pairs only).
