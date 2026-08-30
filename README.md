@@ -106,11 +106,30 @@ Notes:
   purpose**, since it is slower than the CPU fallback it would be replacing;
   `SALMON_GPU_ALLOW_SOFTWARE=1` overrides that, which is how CI exercises the
   shader on a runner with no GPU.
-- **Performance is workload-dependent.** Each short-read banded DP is tiny, so the
-  win comes from batching a whole mini-batch into one dispatch. On Apple Silicon
-  (unified memory) it is fastest; against a many-core CPU it is not yet a
-  guaranteed net speedup — measure on your data. This is an early, correctness-first
-  backend; throughput work is ongoing.
+- **What it speeds up, measured.** Each short-read banded DP is tiny, so the win
+  comes from batching a whole mini-batch into one dispatch. On an M4 Max (Metal),
+  2M read pairs against 8,000 transcripts arranged as 2,000 families of 4
+  paralogs at 2% divergence, so that every read has several candidate placements
+  to tell apart:
+
+  | mode | 4 threads | 8 threads | 16 threads |
+  |---|---|---|---|
+  | `--fullLengthAlignment` (CPU) | 13.6 s | 7.4 s | 4.7-5.1 s |
+  | `--fullLengthAlignment --gpu` | 9.0 s | 5.0 s | 3.4-3.5 s |
+  | default (selective alignment, CPU) | 8.0 s | | 2.8-3.0 s |
+
+  So the GPU is worth roughly **1.4x on the full-length path**, and the raw
+  alignment throughput probe (`cargo test --release -p salmon-gpu --features gpu
+  --test bench_throughput -- --ignored --nocapture`) puts the kernel at 6.8x one
+  ksw2rs thread: 1.96 vs 0.29 M alignments/s.
+
+- **It does not make salmon faster than the default.** `--gpu` implies
+  `--fullLengthAlignment`, which is strictly more work than the default selective
+  alignment, and the default still wins on the same data (2.8 s vs 3.4 s at 16
+  threads). The GPU shrinks the price of full-length scoring from ~1.7x the
+  default to ~1.2x; it does not erase it. Reach for `--gpu` when you want
+  full-length scoring, not as a general speedup. Measure on your own data:
+  a workload with few candidates per read leaves the GPU nothing to batch.
 
 ## Documentation
 
