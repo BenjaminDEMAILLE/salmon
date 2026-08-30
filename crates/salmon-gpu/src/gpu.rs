@@ -48,6 +48,10 @@ pub struct GpuContext {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Which adapter and native API this context actually got. Reported by the
+    /// caller so a run's log says whether it ran on a discrete GPU over Vulkan,
+    /// on Metal, or on something else entirely.
+    adapter: wgpu::AdapterInfo,
 }
 
 impl GpuContext {
@@ -63,6 +67,18 @@ impl GpuContext {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))?;
+        let info = adapter.get_info();
+        // A software rasterizer (lavapipe/llvmpipe/SwiftShader) advertises itself
+        // as an adapter and would run the kernel correctly but far slower than
+        // `RefAligner`, while the log claimed a GPU. Decline it so the caller
+        // falls back to the CPU backend it would have beaten anyway. Set
+        // SALMON_GPU_ALLOW_SOFTWARE=1 to keep it, which is how the shader gets
+        // exercised in CI on a machine with no real GPU.
+        if info.device_type == wgpu::DeviceType::Cpu
+            && std::env::var_os("SALMON_GPU_ALLOW_SOFTWARE").is_none()
+        {
+            return None;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -111,7 +127,19 @@ impl GpuContext {
             queue,
             pipeline,
             bind_group_layout,
+            adapter: info,
         })
+    }
+
+    /// One line naming the adapter this context runs on: its name, the native
+    /// API wgpu chose (Metal, Vulkan, DX12), and whether it is a discrete GPU.
+    /// Logged at startup so a `--gpu` run on someone else's machine says what it
+    /// actually used, rather than leaving a slow run unexplained.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} ({:?}, {:?})",
+            self.adapter.name, self.adapter.backend, self.adapter.device_type
+        )
     }
 
     /// Score a batch of alignments on the GPU. Result `i` corresponds to task

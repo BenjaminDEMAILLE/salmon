@@ -92,8 +92,20 @@ Notes:
   *where* alignment runs, not the result. Alignment scores are integer-valued, so
   the GPU backend reproduces the CPU backend exactly and salmon stays deterministic.
 - It runs via [`wgpu`](https://github.com/gfx-rs/wgpu): one WGSL compute shader on
-  Metal (Apple) or Vulkan (Linux/NVIDIA). No CUDA/Metal SDK is needed at build.
-  If no GPU adapter is found it falls back to a CPU full-length backend.
+  whichever native API is present, Metal on Apple and Vulkan on Linux. **An NVIDIA
+  card is driven through Vulkan, not CUDA**: there is no CUDA toolkit to install,
+  no `.cu` kernel, and nothing extra to pass to `cargo build` beyond
+  `--features gpu`. The same is true of AMD and Intel cards.
+- At startup a `--gpu` run logs the adapter it acquired and the API it went
+  through, for example `GPU alignment backend ready (full-length mode): NVIDIA
+  GeForce RTX 4090 (Vulkan, DiscreteGpu)`. Check that line first when a `--gpu`
+  run is not faster than the CPU: it is how you tell a discrete GPU from an
+  integrated one.
+- If no usable adapter is found it falls back to a CPU full-length backend. A
+  software rasterizer (lavapipe, llvmpipe, SwiftShader) is **declined on
+  purpose**, since it is slower than the CPU fallback it would be replacing;
+  `SALMON_GPU_ALLOW_SOFTWARE=1` overrides that, which is how CI exercises the
+  shader on a runner with no GPU.
 - **Performance is workload-dependent.** Each short-read banded DP is tiny, so the
   win comes from batching a whole mini-batch into one dispatch. On Apple Silicon
   (unified memory) it is fastest; against a many-core CPU it is not yet a

@@ -92,6 +92,12 @@ mod gpu_backend {
         pub fn new() -> Option<Self> {
             GpuContext::new().map(|ctx| Self { ctx })
         }
+
+        /// Which adapter and native API this backend acquired. See
+        /// [`GpuContext::describe`].
+        pub fn describe(&self) -> String {
+            self.ctx.describe()
+        }
     }
 
     impl Aligner for GpuAligner {

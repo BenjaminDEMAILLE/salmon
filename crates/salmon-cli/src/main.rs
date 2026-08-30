@@ -41,9 +41,7 @@ use salmon_align::{
     ExplicitFldArgs, FldPolicy, GenomeProjectOptions,
 };
 use salmon_index::{build as build_index, IndexBuildOptions};
-use salmon_quant::{
-    quantify, quantify_with_aligner, ChunkCodec, EmAccel, ProgressCounters, QuantOptions,
-};
+use salmon_quant::{quantify_with_aligner, ChunkCodec, EmAccel, ProgressCounters, QuantOptions};
 
 /// Build the optional selective-alignment backend for `--gpu`. Returns `None`
 /// for the default CPU path. With the `gpu` feature, `--gpu` acquires a GPU
@@ -58,11 +56,22 @@ fn build_alignment_backend(
     }
     match salmon_gpu::GpuAligner::new() {
         Some(g) => {
-            tracing::info!("GPU alignment backend ready (full-length mode)");
+            // Name the adapter and the native API it went through. On a machine
+            // this build has never run on, that line is the difference between
+            // "the discrete GPU over Vulkan" and "the integrated one", which is
+            // the first thing to check when a --gpu run is not faster.
+            tracing::info!(
+                "GPU alignment backend ready (full-length mode): {}",
+                g.describe()
+            );
             Ok(Some(Box::new(g)))
         }
         None => {
-            tracing::warn!("--gpu: no GPU adapter found; using the CPU full-length backend");
+            tracing::warn!(
+                "--gpu: no usable GPU adapter found; using the CPU full-length backend. \
+                 A software rasterizer is declined on purpose (it is slower than this \
+                 fallback); set SALMON_GPU_ALLOW_SOFTWARE=1 to use one anyway."
+            );
             Ok(Some(Box::new(salmon_gpu::RefAligner)))
         }
     }
@@ -1387,6 +1396,10 @@ fn run_deterministic(
     // The live mapping spinner, owned here so it can be stopped the moment
     // phase 1 finishes (its counters do not advance during the requant).
     spinner: Option<ProgressGuard>,
+    // The selective-alignment backend for phase 1 (`--gpu`), or `None` for the
+    // in-place CPU path. Phase 2 requantifies from the RAD and does no
+    // alignment, so it never needs one.
+    aligner: Option<&(dyn salmon_map::Aligner + Sync)>,
 ) -> Result<()> {
     // Wall-clock accounting spans both phases: phase 2 rewrites
     // `meta_info.json` into the final output directory, and its
@@ -1467,7 +1480,7 @@ fn run_deterministic(
     // bake them (see `QuantOptions::deterministic_fld`), so phase 2 is a single
     // pass and the whole result is byte-identical across thread counts.
     map_opts.deterministic_fld = true;
-    let map_res = match quantify(&map_opts) {
+    let map_res = match quantify_with_aligner(&map_opts, aligner) {
         Ok(r) => r,
         Err(e) => {
             if !explicit {
@@ -3056,6 +3069,15 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
     // thread count, no second mapping pass). `--online` selects the deprecated
     // one-pass path below.
     if !args.online {
+        // `--gpu` accelerates alignment, which in this mode happens in phase 1.
+        // Both the flag's implication and the backend have to be applied here:
+        // deterministic became the default in 2.6.0, so the one-pass path below
+        // is no longer where a plain `--gpu` run lands.
+        if args.gpu {
+            // --gpu only scores in full-length mode (the batchable banded DP).
+            opts.map_config.align.full_length_alignment = true;
+        }
+        let aligner = build_alignment_backend(args.gpu)?;
         let rad_out = opts.write_rad.take(); // honour an explicit --writeRad path
                                              // The phase-1 mapping spinner, wired exactly as the one-pass path wires
                                              // its own: a default mode cannot be a silent black box for the minutes
@@ -3076,6 +3098,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
             gene_map.as_ref(),
             &out_dir,
             spinner,
+            aligner.as_deref(),
         );
     }
     // `--initUniform` asks for a uniform optimizer start, and in one-pass reads
