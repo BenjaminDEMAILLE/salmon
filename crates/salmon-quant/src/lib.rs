@@ -403,6 +403,18 @@ pub struct QuantResult {
 /// See the module documentation for the phases; the `PhaseTimer` marks below
 /// delimit them in the log.
 pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+    quantify_with_aligner(opts, None)
+}
+
+/// Like [`quantify`] but with an explicit selective-alignment backend.
+///
+/// `aligner` overrides the selective-alignment backend: pass `Some` (e.g. a GPU
+/// backend) to score each mini-batch's candidate alignments in one batched
+/// dispatch in full-length mode. `None` keeps the in-place CPU path.
+pub fn quantify_with_aligner(
+    opts: &QuantOptions,
+    aligner: Option<&(dyn salmon_map::Aligner + Sync)>,
+) -> Result<QuantResult> {
     anyhow::ensure!(
         opts.write_mappings.is_none() || opts.write_bam.is_none(),
         "--writeMappings and --writeBam are mutually exclusive"
@@ -691,6 +703,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             fld: &fld,
             detector: detector.as_ref(),
             map_cfg: &opts.map_config,
+            aligner,
             sketch: opts.sketch,
             sketch_strict_orphan: opts.sketch_strict_orphan,
             max_read_occ: opts.max_read_occ,
