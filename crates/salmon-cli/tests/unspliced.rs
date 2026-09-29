@@ -276,3 +276,95 @@ fn quant_writes_the_spliced_unspliced_summary_on_both_paths() {
         assert!((f - u / (s + u + a)).abs() < 1e-3, "{label}: {f}");
     }
 }
+
+/// With the genome as decoys, intergenic fragments go to the decoy and form
+/// the fourth category of the run-level split; intronic ones tie between the
+/// intron target and the genome and stay unspliced.
+#[test]
+fn decoy_fragments_are_the_fourth_category() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    let chr = sequence(7, 4000);
+    let gentrome = tmp.path().join("gentrome.fa");
+    std::fs::write(
+        &gentrome,
+        format!(
+            "{}>chr1\n{chr}\n",
+            std::fs::read_to_string(&fx.txome).unwrap()
+        ),
+    )
+    .unwrap();
+    let decoys = tmp.path().join("decoys.txt");
+    std::fs::write(&decoys, "chr1\n").unwrap();
+    let idx = tmp.path().join("idx");
+    let o = salmon(&[
+        os("index"),
+        os("-t"),
+        gentrome.as_os_str(),
+        os("-d"),
+        decoys.as_os_str(),
+        os("-i"),
+        idx.as_os_str(),
+        os("-p"),
+        os("1"),
+        os("--unspliced"),
+        os("intron"),
+        os("--genome"),
+        fx.genome.as_os_str(),
+        os("--gtf"),
+        fx.gtf.as_os_str(),
+        os("--readLength"),
+        os("75"),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    // 300 spliced + 200 intronic fragments, then 100 intergenic ones
+    let (r1, r2) = reads(tmp.path(), 300, 200);
+    let q = "I".repeat(75);
+    let (mut a, mut b) = (
+        std::fs::read_to_string(&r1).unwrap(),
+        std::fs::read_to_string(&r2).unwrap(),
+    );
+    let inter = &chr[3000..4000];
+    for i in 0..100 {
+        let start = (i * 7) % (inter.len() - 250);
+        let frag = &inter[start..start + 250];
+        a.push_str(&format!("@g{i}\n{}\n+\n{q}\n", &frag[..75]));
+        b.push_str(&format!("@g{i}\n{}\n+\n{q}\n", revcomp(&frag[175..])));
+    }
+    std::fs::write(&r1, a).unwrap();
+    std::fs::write(&r2, b).unwrap();
+
+    let out = tmp.path().join("q");
+    let o = salmon(&[
+        os("quant"),
+        os("-i"),
+        idx.as_os_str(),
+        os("-l"),
+        os("A"),
+        os("-1"),
+        r1.as_os_str(),
+        os("-2"),
+        r2.as_os_str(),
+        os("-p"),
+        os("2"),
+        os("-o"),
+        out.as_os_str(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("aux_info/meta_info.json")).unwrap(),
+    )
+    .unwrap();
+    let m = &meta["unspliced"];
+    let decoy = m["num_decoy_fragments"].as_f64().unwrap();
+    assert_eq!(decoy, meta["num_decoy_fragments"].as_f64().unwrap());
+    assert!((90.0..=100.0).contains(&decoy), "decoy fragments {decoy}");
+    let w = &m["fractions_with_decoys"];
+    let f = |k: &str| w[k].as_f64().unwrap();
+    let sum = f("spliced") + f("unspliced") + f("ambiguous") + f("decoy");
+    assert!((sum - 1.0).abs() < 1e-9, "{w}");
+    // the intronic fragments were not lost to the decoy
+    let u = m["num_unspliced_fragments"].as_f64().unwrap();
+    assert!(u > 150.0, "unspliced {u}");
+}

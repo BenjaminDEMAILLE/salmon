@@ -130,7 +130,7 @@ aggregates (no per-fragment cost) and are emitted for every mode — reads,
 | `total_time_seconds` | float | wall-clock seconds for the quantification call |
 | `peak_rss_kb` | int | peak resident set size in KiB (Linux `VmHWM`; 0 elsewhere) |
 | `diagnostics` | object[] | structured run diagnostics (see below) |
-| `unspliced` | object | only for an index built with `salmon index --unspliced` (reads mode): `mode`, `num_spliced_targets`, `num_unspliced_targets`, `num_genes`, `num_{spliced,unspliced,ambiguous}_fragments` and the matching `*_fraction`s (of their sum). Omitted otherwise, so other runs keep the same file |
+| `unspliced` | object | only for an index built with `salmon index --unspliced` (reads mode): `mode`, `num_spliced_targets`, `num_unspliced_targets`, `num_genes`, `num_{spliced,unspliced,ambiguous,decoy}_fragments`, the spliced / unspliced / ambiguous `*_fraction`s of the assigned fragments, and `fractions_with_decoys` (`spliced`, `unspliced`, `ambiguous`, `decoy`) of assigned + decoy fragments. Omitted otherwise, so other runs keep the same file |
 
 ##### `diagnostics` — machine-readable run warnings
 

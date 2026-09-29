@@ -2356,7 +2356,12 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
             let table = ann
                 .table(&names, rows)
                 .context("aligning the index's t2g_3col.tsv to the RAD references")?;
-            Some(salmon_infer::splicing_summary(&packed, &counts, &table))
+            Some(salmon_infer::splicing_summary(
+                &packed,
+                &counts,
+                &table,
+                provenance.counters.map_or(0, |c| c.num_decoy_fragments),
+            ))
         }
         _ => None,
     };

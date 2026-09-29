@@ -25,11 +25,13 @@ use crate::PackedEqClasses;
 
 /// Split every class's fragments between genes by the final abundances and
 /// file each gene's share as spliced, unspliced or ambiguous (see the module
-/// docs).
+/// docs). `decoy_fragments` (the run's decoy-dominated fragments) is carried
+/// into the summary as the run-level fourth category.
 pub fn splicing_summary(
     p: &PackedEqClasses,
     alphas: &[f64],
     table: &SpliceTable,
+    decoy_fragments: u64,
 ) -> SplicingSummary {
     let ng = table.genes.len();
     let (mut s, mut u, mut a) = (vec![0.0; ng], vec![0.0; ng], vec![0.0; ng]);
@@ -85,6 +87,7 @@ pub fn splicing_summary(
         ambiguous: a,
         num_spliced_targets,
         num_unspliced_targets,
+        decoy_fragments: decoy_fragments as f64,
     }
 }
 
@@ -128,7 +131,7 @@ mod tests {
             6,
         );
         let alphas = [1.0, 1.0, 1.0, 1.0, 3.0, 0.0];
-        let sum = splicing_summary(&p, &alphas, &table);
+        let sum = splicing_summary(&p, &alphas, &table, 0);
         let close = |x: f64, y: f64| (x - y).abs() < 1e-9;
         assert!(close(sum.spliced[0], 16.0), "{:?}", sum.spliced);
         assert!(close(sum.unspliced[0], 4.0 + 3.0), "{:?}", sum.unspliced);
@@ -150,7 +153,7 @@ mod tests {
             unspliced: vec![false, true],
         };
         let p = packed(&[(vec![0, 1], 7), (vec![1], 3)], 2);
-        let sum = splicing_summary(&p, &[5.0, 0.0], &table);
+        let sum = splicing_summary(&p, &[5.0, 0.0], &table, 0);
         // the first class holds both forms of A: ambiguous, whatever the split
         assert_eq!(sum.totals(), (0.0, 0.0, 7.0));
     }

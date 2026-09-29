@@ -1343,7 +1343,12 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                     salmon.info().num_decoys,
                 );
                 let table = ann.table(&names, rows)?;
-                Some(salmon_infer::splicing_summary(&packed, &counts, &table))
+                Some(salmon_infer::splicing_summary(
+                    &packed,
+                    &counts,
+                    &table,
+                    num_decoy.load(Ordering::Relaxed),
+                ))
             }
             None => None,
         }

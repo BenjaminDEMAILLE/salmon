@@ -72,7 +72,10 @@ unspliced targets as extra rows, and two outputs are added:
   gene's `NumReads` in `quant.sf`. This is alevin-fry's USA split applied to
   bulk EM counts.
 - an `unspliced` block in `aux_info/meta_info.json`, with the fraction of
-  assigned fragments filed under each status.
+  assigned fragments filed under each status, and `fractions_with_decoys`: the
+  same split with the decoy-dominated fragments as a fourth category, over
+  assigned + decoy fragments. That is the figure to compare between libraries:
+  it does not depend on how much each library lost to the decoys.
 
 ## Downstream: tximport and DESeq2
 

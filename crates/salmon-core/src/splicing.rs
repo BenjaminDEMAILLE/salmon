@@ -134,6 +134,10 @@ pub struct SplicingSummary {
     pub ambiguous: Vec<f64>,
     pub num_spliced_targets: usize,
     pub num_unspliced_targets: usize,
+    /// fragments dropped because their best alignment was to a decoy; they
+    /// belong to no gene, but are the fourth category of the run-level split
+    /// (the genome-derived share an unspliced index did not claim)
+    pub decoy_fragments: f64,
 }
 
 impl SplicingSummary {
@@ -165,6 +169,16 @@ pub fn write_usa_tsv(path: &Path, sp: &SplicingSummary, sig_digits: usize) -> io
     w.flush()
 }
 
+/// Run-level split of assigned *and* decoy fragments, as fractions of their
+/// sum.
+#[derive(Debug, Clone, Serialize)]
+pub struct FractionsWithDecoys {
+    pub spliced: f64,
+    pub unspliced: f64,
+    pub ambiguous: f64,
+    pub decoy: f64,
+}
+
 /// The `unspliced` block of `meta_info.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnsplicedMeta {
@@ -176,10 +190,15 @@ pub struct UnsplicedMeta {
     pub num_spliced_fragments: f64,
     pub num_unspliced_fragments: f64,
     pub num_ambiguous_fragments: f64,
-    /// the three above as fractions of their sum
+    /// fragments dropped as decoy-dominated (no gene)
+    pub num_decoy_fragments: f64,
+    /// spliced / unspliced / ambiguous as fractions of the assigned fragments
     pub spliced_fraction: f64,
     pub unspliced_fraction: f64,
     pub ambiguous_fraction: f64,
+    /// the four categories as fractions of assigned + decoy fragments, so
+    /// libraries compare whatever share their decoys took
+    pub fractions_with_decoys: FractionsWithDecoys,
 }
 
 impl From<&SplicingSummary> for UnsplicedMeta {
@@ -187,6 +206,9 @@ impl From<&SplicingSummary> for UnsplicedMeta {
         let (s, u, a) = sp.totals();
         let total = s + u + a;
         let frac = |x: f64| if total > 0.0 { x / total } else { 0.0 };
+        let d = sp.decoy_fragments;
+        let all = total + d;
+        let frac_all = |x: f64| if all > 0.0 { x / all } else { 0.0 };
         Self {
             mode: sp.mode.clone(),
             num_spliced_targets: sp.num_spliced_targets,
@@ -195,9 +217,16 @@ impl From<&SplicingSummary> for UnsplicedMeta {
             num_spliced_fragments: s,
             num_unspliced_fragments: u,
             num_ambiguous_fragments: a,
+            num_decoy_fragments: d,
             spliced_fraction: frac(s),
             unspliced_fraction: frac(u),
             ambiguous_fraction: frac(a),
+            fractions_with_decoys: FractionsWithDecoys {
+                spliced: frac_all(s),
+                unspliced: frac_all(u),
+                ambiguous: frac_all(a),
+                decoy: frac_all(d),
+            },
         }
     }
 }
@@ -236,8 +265,12 @@ mod tests {
             ambiguous: vec![2.0, 0.0],
             num_spliced_targets: 2,
             num_unspliced_targets: 1,
+            decoy_fragments: 10.0,
         };
         let m = UnsplicedMeta::from(&sp);
+        let w = &m.fractions_with_decoys;
+        assert!((w.spliced + w.unspliced + w.ambiguous + w.decoy - 1.0).abs() < 1e-12);
+        assert!((w.decoy - 0.5).abs() < 1e-12);
         assert_eq!(m.num_unspliced_fragments, 4.0);
         assert!(
             (m.spliced_fraction + m.unspliced_fraction + m.ambiguous_fraction - 1.0).abs() < 1e-12
