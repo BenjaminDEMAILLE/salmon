@@ -358,6 +358,140 @@ pub fn unspliced_targets(
     out
 }
 
+/// What [`write_unspliced_fasta`] did.
+#[derive(Debug, Default)]
+pub struct ExtractStats {
+    /// targets written to the FASTA
+    pub written: usize,
+    /// targets whose flank ran past the end of their sequence and was clipped
+    pub clipped: usize,
+    /// targets dropped because less than half of their bases are ACGT (for
+    /// example a gene on a hard-masked PAR copy of chrY): non-ACGT bases would
+    /// otherwise be replaced by random ones at indexing time
+    pub dropped_low_acgt: Vec<String>,
+    /// targets dropped because their sequence is absent from the genome FASTA
+    pub dropped_missing_seq: usize,
+    /// annotation sequence names absent from the genome FASTA
+    pub missing_seqnames: Vec<String>,
+}
+
+/// Complement of an (uppercase) base; anything but ACGT becomes `N`.
+fn complement(b: u8) -> u8 {
+    match b {
+        b'A' => b'T',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'T' => b'A',
+        _ => b'N',
+    }
+}
+
+/// Stream `genome` one sequence at a time and write the sequence of every
+/// target to `out` (uppercased, reverse-complemented for minus-strand genes).
+///
+/// Only one chromosome is held in memory at a time. Records are written in
+/// genome FASTA order, then by start, end and name, so the output (and hence
+/// the index) is a deterministic function of the inputs. Sequences are matched
+/// on the first whitespace-delimited token of the FASTA header, the GTF
+/// `seqname` convention of both GENCODE (`chr1`) and Ensembl (`1`).
+pub fn write_unspliced_fasta(
+    genome: &Path,
+    targets: &[UnsplicedTarget],
+    out: &Path,
+) -> Result<ExtractStats> {
+    use std::io::Write as _;
+    let mut by_seq: HashMap<&str, Vec<&UnsplicedTarget>> = HashMap::new();
+    for t in targets {
+        by_seq.entry(t.seqname.as_str()).or_default().push(t);
+    }
+    for v in by_seq.values_mut() {
+        v.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
+    }
+    let mut w = std::io::BufWriter::new(
+        std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?,
+    );
+    let mut stats = ExtractStats::default();
+    let mut seen_seqs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reader = needletail::parse_fastx_file(genome)
+        .with_context(|| format!("opening genome {}", genome.display()))?;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(rec) = reader.next() {
+        let rec = rec.context("reading genome FASTA record")?;
+        let id = rec.id();
+        let end = id
+            .iter()
+            .position(|b| b.is_ascii_whitespace())
+            .unwrap_or(id.len());
+        let seqname = String::from_utf8_lossy(&id[..end]).into_owned();
+        if !seen_seqs.insert(seqname.clone()) {
+            bail!(
+                "genome sequence {seqname:?} appears twice in {}",
+                genome.display()
+            );
+        }
+        let Some(ts) = by_seq.get(seqname.as_str()) else {
+            continue;
+        };
+        let seq = rec.seq();
+        let len = seq.len() as u64;
+        for t in ts {
+            if t.start >= len {
+                stats.dropped_missing_seq += 1;
+                continue;
+            }
+            let stop = t.end.min(len);
+            if stop < t.end {
+                stats.clipped += 1;
+            }
+            let slice = &seq[t.start as usize..stop as usize];
+            buf.clear();
+            match t.strand {
+                Strand::Plus => buf.extend(slice.iter().map(u8::to_ascii_uppercase)),
+                Strand::Minus => buf.extend(
+                    slice
+                        .iter()
+                        .rev()
+                        .map(|b| complement(b.to_ascii_uppercase())),
+                ),
+            }
+            let acgt = buf
+                .iter()
+                .filter(|&&b| matches!(b, b'A' | b'C' | b'G' | b'T'))
+                .count();
+            if acgt * 2 < buf.len() {
+                stats.dropped_low_acgt.push(t.name.clone());
+                continue;
+            }
+            w.write_all(b">")?;
+            w.write_all(t.name.as_bytes())?;
+            w.write_all(b"\n")?;
+            w.write_all(&buf)?;
+            w.write_all(b"\n")?;
+            stats.written += 1;
+        }
+    }
+    w.flush()?;
+    let mut missing: Vec<&str> = by_seq
+        .iter()
+        .filter(|(s, _)| !seen_seqs.contains(**s))
+        .map(|(s, ts)| {
+            stats.dropped_missing_seq += ts.len();
+            *s
+        })
+        .collect();
+    missing.sort_unstable();
+    stats.missing_seqnames = missing.into_iter().map(str::to_string).collect();
+    if stats.written == 0 && !targets.is_empty() {
+        bail!(
+            "none of the {} unspliced targets could be extracted from {}: do the GTF \
+             sequence names match the genome FASTA headers?",
+            targets.len(),
+            genome.display()
+        );
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +685,80 @@ chrY\tt\texon\t21\t30\t.\t+\t.\tgene_id \"P\"; transcript_id \"T\";
             assert_eq!(m.as_str().parse::<UnsplicedMode>().unwrap(), m);
         }
         assert!("splici".parse::<UnsplicedMode>().is_err());
+    }
+
+    #[test]
+    fn extracts_stranded_uppercase_sequences_in_genome_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let genome = dir.path().join("g.fa");
+        // chrY first in the FASTA: output follows genome order, not GTF order.
+        // chrY's second half is hard-masked (N), like a PAR copy.
+        let chr1: String = (0..1600).map(|i| b"ACGTTGCA"[i % 8] as char).collect();
+        let chr_y = format!("{}{}", "acgt".repeat(10), "N".repeat(160));
+        std::fs::write(
+            &genome,
+            format!(
+                ">chrY  Y chromosome\n{chr_y}\n>chr1 1\n{}\n{}\n>chrM\nACGT\n",
+                &chr1[..800],
+                &chr1[800..]
+            ),
+        )
+        .unwrap();
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        let mut ts = unspliced_targets(&a, UnsplicedMode::Intron, 0);
+        // a target on a sequence the genome lacks, and one running off chr1's end
+        ts.push(UnsplicedTarget {
+            name: "Z-I".into(),
+            gene_id: "Z".into(),
+            seqname: "chrZ".into(),
+            strand: Strand::Plus,
+            start: 0,
+            end: 10,
+        });
+        ts.push(UnsplicedTarget {
+            name: "E-I".into(),
+            gene_id: "E".into(),
+            seqname: "chr1".into(),
+            strand: Strand::Plus,
+            start: 1590,
+            end: 1700,
+        });
+        let out = dir.path().join("u.fa");
+        let st = write_unspliced_fasta(&genome, &ts, &out).unwrap();
+        // G4_PAR_Y-I (60..120 on chrY) is all N: dropped.
+        assert_eq!(st.dropped_low_acgt, ["G4_PAR_Y-I"]);
+        assert_eq!(st.missing_seqnames, ["chrZ"]);
+        assert_eq!(st.dropped_missing_seq, 1);
+        assert_eq!(st.clipped, 1);
+        assert_eq!(st.written, 4);
+        let text = std::fs::read_to_string(&out).unwrap();
+        let recs: Vec<(&str, &str)> = text
+            .lines()
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|c| (c[0], c[1]))
+            .collect();
+        let names: Vec<&str> = recs.iter().map(|r| r.0).collect();
+        assert_eq!(names, [">G1-I", ">G1-I1", ">G3-I", ">E-I"]);
+        assert_eq!(recs[0].1, &chr1[200..300]);
+        assert_eq!(recs[3].1, &chr1[1590..]);
+        // G3 is on the minus strand: reverse complement of 950..1100
+        let rc: String = chr1[950..1100]
+            .bytes()
+            .rev()
+            .map(|b| complement(b) as char)
+            .collect();
+        assert_eq!(recs[2].1, rc);
+    }
+
+    #[test]
+    fn extraction_fails_when_no_sequence_name_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let genome = dir.path().join("g.fa");
+        std::fs::write(&genome, ">1\nACGTACGTACGT\n").unwrap();
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        let ts = unspliced_targets(&a, UnsplicedMode::Intron, 0);
+        let err = write_unspliced_fasta(&genome, &ts, &dir.path().join("u.fa")).unwrap_err();
+        assert!(err.to_string().contains("sequence names"), "{err}");
     }
 }
