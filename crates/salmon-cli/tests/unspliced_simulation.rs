@@ -217,7 +217,14 @@ fn os(s: &str) -> &std::ffi::OsStr {
     s.as_ref()
 }
 
-fn index_and_quant(sim: &Sim, dir: &Path, unspliced: Option<&str>) -> HashMap<String, f64> {
+/// Build a gentrome index (plus unspliced targets of `mode` in `layout`) and
+/// quantify the simulated reads; returns NumReads by target name.
+fn index_and_quant(
+    sim: &Sim,
+    dir: &Path,
+    unspliced: Option<&str>,
+    layout: &str,
+) -> HashMap<String, f64> {
     let idx = dir.join("idx");
     let mut args = vec![
         os("index"),
@@ -240,9 +247,18 @@ fn index_and_quant(sim: &Sim, dir: &Path, unspliced: Option<&str>) -> HashMap<St
             sim.gtf.as_os_str(),
             os("--readLength"),
             os("75"),
+            os("--unsplicedLayout"),
+            os(layout),
         ]);
     }
     run(&args);
+    if unspliced.is_some() {
+        let info = std::fs::read_to_string(idx.join("info.json")).unwrap();
+        assert!(
+            info.contains(&format!("\"layout\": \"{layout}\"")),
+            "{info}"
+        );
+    }
     let out = dir.join("quant");
     run(&[
         os("quant"),
@@ -314,13 +330,31 @@ fn metrics(sim: &Sim, est: &HashMap<String, f64>) -> Metrics {
 fn intron_targets_stop_retained_intron_isoforms_absorbing_pre_mrna() {
     let tmp = tempfile::tempdir().unwrap();
     let sim = simulate(tmp.path());
-    let dirs = ["gentrome", "intron", "premrna"].map(|d| tmp.path().join(d));
+    let dirs =
+        ["gentrome", "intron", "premrna", "intron_seq", "premrna_seq"].map(|d| tmp.path().join(d));
     for d in &dirs {
         std::fs::create_dir_all(d).unwrap();
     }
-    let a = metrics(&sim, &index_and_quant(&sim, &dirs[0], None));
-    let b = metrics(&sim, &index_and_quant(&sim, &dirs[1], Some("intron")));
-    let c = metrics(&sim, &index_and_quant(&sim, &dirs[2], Some("premrna")));
+    // With the genome as decoys the default layout is projection.
+    let a = metrics(&sim, &index_and_quant(&sim, &dirs[0], None, "auto"));
+    let b_est = index_and_quant(&sim, &dirs[1], Some("intron"), "projection");
+    let c_est = index_and_quant(&sim, &dirs[2], Some("premrna"), "projection");
+    let (b, c) = (metrics(&sim, &b_est), metrics(&sim, &c_est));
+    // The sequence layout indexes the same targets' k-mers instead: the
+    // projection is meant to find exactly the alignments it finds.
+    for (est, dir, mode) in [(&b_est, &dirs[3], "intron"), (&c_est, &dirs[4], "premrna")] {
+        let seq = index_and_quant(&sim, dir, Some(mode), "sequence");
+        let total: f64 = seq.values().sum();
+        let moved: f64 = seq.iter().map(|(n, v)| (v - est[n]).abs()).sum();
+        eprintln!(
+            "{mode}: projection vs sequence layout, {:.4}% of fragment mass moved",
+            100.0 * moved / total
+        );
+        assert!(
+            moved < 0.005 * total,
+            "{mode}: {moved} of {total} moved between layouts"
+        );
+    }
     let ri_truth: usize = sim.retained.iter().map(|n| sim.truth[n]).sum();
     eprintln!(
         "simulated: {} spliced + {} pre-mRNA fragments; retained-intron isoforms carry {} true fragments",

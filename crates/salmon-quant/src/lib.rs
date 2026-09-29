@@ -422,6 +422,44 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
     let salmon = SalmonIndex::load_with_opts(&opts.index_dir, need_refseq)
         .with_context(|| format!("loading index {}", opts.index_dir.display()))?;
     let num_refs = salmon.num_refs();
+    // Projection-layout unspliced index: genome-decoy alignments inside a
+    // target's interval are copied onto the target (see `salmon_map::project`).
+    // Sketch mode has no alignments to project.
+    let map_config = {
+        let mut c = opts.map_config.clone();
+        if let Some(targets) = salmon.projection_targets() {
+            anyhow::ensure!(
+                !opts.sketch,
+                "this index holds its unspliced targets in the projection layout, which needs \
+                 selective alignment: drop --sketch, or rebuild the index with \
+                 --unsplicedLayout sequence"
+            );
+            let fdi = salmon
+                .info()
+                .first_decoy_index
+                .context("projection-layout index without decoys")?;
+            c.projection = Some(std::sync::Arc::new(salmon_map::UnsplicedProjection::new(
+                fdi as u32,
+                salmon.info().num_decoys,
+                targets.iter().map(|t| {
+                    (
+                        t.decoy,
+                        salmon_map::ProjectionTarget {
+                            tid: t.tid,
+                            start: t.start,
+                            end: t.end,
+                            minus: t.minus,
+                        },
+                    )
+                }),
+            )));
+            tracing::info!(
+                "projecting genome-decoy alignments onto {} unspliced target(s)",
+                targets.len()
+            );
+        }
+        c
+    };
     // Splicing status of each reference for an index built with `--unspliced`
     // (`None` otherwise): the spliced / unspliced summary and the bias sweeps'
     // position stride read it. Only `info.json` and the small table are read.
@@ -716,7 +754,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             eq: &eq_builder,
             fld: &fld,
             detector: detector.as_ref(),
-            map_cfg: &opts.map_config,
+            map_cfg: &map_config,
             sketch: opts.sketch,
             sketch_strict_orphan: opts.sketch_strict_orphan,
             max_read_occ: opts.max_read_occ,

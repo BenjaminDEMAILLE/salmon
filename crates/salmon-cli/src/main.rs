@@ -395,6 +395,18 @@ struct IndexArgs {
     /// readLength - 1 (--unspliced intron).
     #[arg(long = "readLength", value_parser = clap::value_parser!(u64).range(1..))]
     read_length: Option<u64>,
+    /// How --unspliced targets are held. `projection`: they carry no k-mers;
+    /// alignments to the genome decoy that fall inside a target are projected
+    /// onto it, so the index and mapping cost stay those of the gentrome
+    /// (needs the same genome as decoys, -d). `sequence`: their sequence is
+    /// indexed like a transcript's (works without decoys; costs more).
+    /// `auto` (default): projection when every target lies on a decoy.
+    #[arg(
+        long = "unsplicedLayout",
+        default_value = "auto",
+        value_parser = ["auto", "projection", "sequence"]
+    )]
+    unspliced_layout: String,
 }
 
 #[derive(Args)]
@@ -1005,6 +1017,10 @@ fn run_index(args: IndexArgs) -> Result<()> {
     opts.genome = args.genome;
     opts.gtf = args.gtf;
     opts.flank = args.flank.or(args.read_length.map(|l| l - 1));
+    opts.unspliced_layout = args
+        .unspliced_layout
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     let info = build_index(&opts).context("index build failed")?;
     println!(
         "indexed {} references (k={}, m={})",

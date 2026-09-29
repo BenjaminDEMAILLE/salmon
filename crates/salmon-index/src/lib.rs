@@ -1347,7 +1347,7 @@ fn prepare_unspliced(
             .iter()
             .all(|t| decoy_names.contains(t.seqname.as_bytes()));
     let layout = match opts.unspliced_layout {
-        // Projection is opt-in until quant can project (next step).
+        UnsplicedLayout::Auto if on_decoys => UnsplicedLayout::Projection,
         UnsplicedLayout::Auto => UnsplicedLayout::Sequence,
         UnsplicedLayout::Projection => {
             anyhow::ensure!(
