@@ -1803,6 +1803,44 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
         "RAD ref_lengths ({}) does not match ref_names ({num_refs})",
         lengths.len()
     );
+    // Splicing status of each reference, when the driver passed the annotation
+    // of the (unspliced) index this RAD was mapped to: it feeds the
+    // spliced / unspliced summary and the bias sweeps' position stride.
+    let splice_table = match &opts.splice_annotation {
+        Some(ann) => {
+            let (first_decoy, num_decoys) = provenance
+                .index
+                .as_ref()
+                .map(|ix| {
+                    (
+                        ix.first_decoy_index.map(|v| v as usize),
+                        ix.num_decoys.unwrap_or(0) as usize,
+                    )
+                })
+                .unwrap_or((None, 0));
+            let rows = salmon_core::quant_row_indices(names.len(), first_decoy, num_decoys);
+            Some(
+                ann.table(&names, rows)
+                    .context("aligning the index's t2g_3col.tsv to the RAD references")?,
+            )
+        }
+        None => None,
+    };
+    // Long unspliced targets are visited at a position stride in the bias
+    // sweeps (spliced targets exactly, stride 1); `None` for any other index.
+    let bias_pos_stride: Option<Vec<usize>> = splice_table.as_ref().map(|t| {
+        t.unspliced
+            .iter()
+            .zip(&lengths)
+            .map(|(&u, &len)| {
+                if u {
+                    salmon_model::unspliced_position_stride(len as usize)
+                } else {
+                    1
+                }
+            })
+            .collect()
+    });
     let scored = matches!(
         profile,
         RadInputProfile::Salmon(salmon_rad::RadProfile::SelectiveAlignment)
@@ -2208,6 +2246,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
             opts.gc_bins,
             opts.bias_speed_samp,
             opts.no_bias_length_threshold,
+            bias_pos_stride.as_deref(),
         );
         collapsed.update_eff_lengths(&eff_lengths);
         packed.refresh_combined(&collapsed);
@@ -2294,6 +2333,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
                 opts.gc_bins,
                 opts.bias_speed_samp,
                 opts.no_bias_length_threshold,
+                bias_pos_stride.as_deref(),
             );
             collapsed.update_eff_lengths(&eff_lengths);
             packed.refresh_combined(&collapsed);
@@ -2340,29 +2380,13 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
     let ambig = salmon_infer::ambiguity_counts(&packed);
     // Spliced / unspliced / ambiguous split, when the driver passed the
     // splicing annotation of the (unspliced) index this RAD was mapped to.
-    let splicing = match (&opts.splice_annotation, opts.skip_quant) {
-        (Some(ann), false) => {
-            let (first_decoy, num_decoys) = provenance
-                .index
-                .as_ref()
-                .map(|ix| {
-                    (
-                        ix.first_decoy_index.map(|v| v as usize),
-                        ix.num_decoys.unwrap_or(0) as usize,
-                    )
-                })
-                .unwrap_or((None, 0));
-            let rows = salmon_core::quant_row_indices(names.len(), first_decoy, num_decoys);
-            let table = ann
-                .table(&names, rows)
-                .context("aligning the index's t2g_3col.tsv to the RAD references")?;
-            Some(salmon_infer::splicing_summary(
-                &packed,
-                &counts,
-                &table,
-                provenance.counters.map_or(0, |c| c.num_decoy_fragments),
-            ))
-        }
+    let splicing = match (&splice_table, opts.skip_quant) {
+        (Some(table), false) => Some(salmon_infer::splicing_summary(
+            &packed,
+            &counts,
+            table,
+            provenance.counters.map_or(0, |c| c.num_decoy_fragments),
+        )),
         _ => None,
     };
     let bootstraps: Vec<Vec<f64>> = if opts.skip_quant {

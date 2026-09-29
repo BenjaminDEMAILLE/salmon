@@ -422,6 +422,29 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
     let salmon = SalmonIndex::load_with_opts(&opts.index_dir, need_refseq)
         .with_context(|| format!("loading index {}", opts.index_dir.display()))?;
     let num_refs = salmon.num_refs();
+    // Splicing status of each reference for an index built with `--unspliced`
+    // (`None` otherwise): the spliced / unspliced summary and the bias sweeps'
+    // position stride read it. Only `info.json` and the small table are read.
+    let splice_table = match salmon_index::load_splice_annotation(&opts.index_dir)? {
+        Some(ann) => {
+            let names: Vec<&str> = (0..num_refs).map(|i| salmon.ref_name(i)).collect();
+            let rows = salmon_core::quant_row_indices(
+                num_refs,
+                salmon.info().first_decoy_index,
+                salmon.info().num_decoys,
+            );
+            Some(ann.table(&names, rows)?)
+        }
+        None => None,
+    };
+    // Long unspliced targets are visited at a position stride in the bias
+    // sweeps; spliced targets (and every target of any other index) exactly.
+    let bias_pos_stride = |t: usize| match &splice_table {
+        Some(tab) if tab.unspliced[t] => {
+            salmon_model::unspliced_position_stride(salmon.ref_len(t) as usize)
+        }
+        _ => 1,
+    };
     timer.mark("index_load");
 
     let eq_builder = EquivalenceClassBuilder::new();
@@ -1088,9 +1111,10 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             let (mut obs_fw, mut obs_rc) = m.into_inner().unwrap();
             obs_fw.normalize();
             obs_rc.normalize();
-            let (exp_fw, exp_rc) = salmon_model::build_expected(
+            let (exp_fw, exp_rc) = salmon_model::build_expected_strided(
                 num_targets,
                 |t| salmon.ref_seq(t as u32),
+                bias_pos_stride,
                 &em.alphas,
                 &eff_lengths,
                 &fld_cdf,
@@ -1117,10 +1141,11 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
         let store = gc_store;
         let gc_ratio_model = if let Some(m) = gcbias_obs {
             let mut obs = m.into_inner().unwrap();
-            let mut exp = salmon_model::build_expected_gc(
+            let mut exp = salmon_model::build_expected_gc_strided(
                 num_targets,
                 |t| salmon.ref_seq(t as u32),
                 |t| store.unwrap().view(t),
+                bias_pos_stride,
                 &em.alphas,
                 &eff_lengths,
                 &fld_cdf,
@@ -1246,7 +1271,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                         .as_ref()
                         .map(|_| (scratch.pf.as_slice(), scratch.pr.as_slice())),
                 };
-                salmon_model::corrected_effective_length_full(
+                salmon_model::corrected_effective_length_strided(
                     s,
                     &fld_cdf,
                     fld_low,
@@ -1255,6 +1280,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                     eff_lengths[tid],
                     opts.bias_speed_samp,
                     opts.no_bias_length_threshold,
+                    bias_pos_stride(tid),
                 )
             })
             .collect();
@@ -1331,27 +1357,14 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
     let ambig = salmon_infer::ambiguity_counts(&packed);
     // Spliced / unspliced / ambiguous split, for an index built with
     // `--unspliced`: the same final E-step as `counts`, filed per gene.
-    let splicing = if opts.skip_quant {
-        None
-    } else {
-        match salmon_index::load_splice_annotation(&opts.index_dir)? {
-            Some(ann) => {
-                let names: Vec<&str> = (0..num_refs).map(|i| salmon.ref_name(i)).collect();
-                let rows = salmon_core::quant_row_indices(
-                    num_refs,
-                    salmon.info().first_decoy_index,
-                    salmon.info().num_decoys,
-                );
-                let table = ann.table(&names, rows)?;
-                Some(salmon_infer::splicing_summary(
-                    &packed,
-                    &counts,
-                    &table,
-                    num_decoy.load(Ordering::Relaxed),
-                ))
-            }
-            None => None,
-        }
+    let splicing = match (&splice_table, opts.skip_quant) {
+        (Some(table), false) => Some(salmon_infer::splicing_summary(
+            &packed,
+            &counts,
+            table,
+            num_decoy.load(Ordering::Relaxed),
+        )),
+        _ => None,
     };
     // Same `posterior` the packed layout was built for, so the run cannot decide
     // it needs Gibbs after the weights it reads were skipped.

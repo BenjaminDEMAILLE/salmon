@@ -2013,6 +2013,10 @@ fn apply_bias_correction(
     gc_bins: usize,
     bias_speed_samp: usize,
     no_bias_length_threshold: bool,
+    // Per-reference position stride for the bias sweeps (long unspliced
+    // targets of an index built with `--unspliced`); `None` means 1 for all,
+    // the exact computation.
+    pos_stride: Option<&[usize]>,
 ) -> salmon_model::dumps::BiasDump {
     use salmon_model::seqbias::CONTEXT_LENGTH;
     let mut bias_dump = salmon_model::dumps::BiasDump::default();
@@ -2021,12 +2025,19 @@ fn apply_bias_correction(
     let (fld_cdf, fld_low, fld_high) = salmon_model::seqbias::fld_cdf_and_bounds(&pmf_lin);
     let k = if seq_bias { CONTEXT_LENGTH } else { 1 };
     let refseq_of = |t: usize| &ref_bytes[t];
+    let stride_of = |t: usize| pos_stride.map_or(1, |s| s[t]);
 
     let seq = seq_obs.map(|(mut of, mut or)| {
         of.normalize();
         or.normalize();
-        let (ef, er) =
-            salmon_model::build_expected(num_targets, refseq_of, alphas, eff_lengths, &fld_cdf);
+        let (ef, er) = salmon_model::build_expected_strided(
+            num_targets,
+            refseq_of,
+            stride_of,
+            alphas,
+            eff_lengths,
+            &fld_cdf,
+        );
         (of, or, ef, er)
     });
     if let Some((of, or, ef, er)) = seq.as_ref() {
@@ -2045,10 +2056,11 @@ fn apply_bias_correction(
         )
     });
     let gc_ratio_model = if let Some(mut obs) = gc_obs {
-        let mut exp = salmon_model::build_expected_gc(
+        let mut exp = salmon_model::build_expected_gc_strided(
             num_targets,
             refseq_of,
             |t| gc_store.view(t),
+            stride_of,
             alphas,
             eff_lengths,
             &fld_cdf,
@@ -2133,7 +2145,7 @@ fn apply_bias_correction(
                     .as_ref()
                     .map(|(pf, pr)| (pf.as_slice(), pr.as_slice())),
             };
-            *eff_length = salmon_model::corrected_effective_length_full(
+            *eff_length = salmon_model::corrected_effective_length_strided(
                 s,
                 &fld_cdf,
                 fld_low,
@@ -2142,6 +2154,7 @@ fn apply_bias_correction(
                 *eff_length,
                 bias_speed_samp,
                 no_bias_length_threshold,
+                stride_of(tid),
             );
         });
     bias_dump
@@ -2511,6 +2524,7 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
             opts.gc_bins,
             opts.bias_speed_samp,
             opts.no_bias_length_threshold,
+            None,
         );
         collapsed.update_eff_lengths(&eff_lengths);
         // Only the combined weights changed; patch them in place.
