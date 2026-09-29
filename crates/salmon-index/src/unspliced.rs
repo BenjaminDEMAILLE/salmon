@@ -245,6 +245,119 @@ pub fn gene_body(gene: &GeneModel) -> Option<Interval> {
     Some((start, end))
 }
 
+/// Which unspliced targets `salmon index --unspliced` adds next to the
+/// spliced transcripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnsplicedMode {
+    /// No unspliced targets (the default; the index is unchanged).
+    #[default]
+    None,
+    /// Merged introns of each gene, extended by a flank on both sides
+    /// (`pyroe make-splici`).
+    Intron,
+    /// The full gene body, first exon start to last exon end
+    /// (`pyroe make-spliceu`).
+    Premrna,
+}
+
+impl UnsplicedMode {
+    /// Name used on the command line and in `info.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnsplicedMode::None => "none",
+            UnsplicedMode::Intron => "intron",
+            UnsplicedMode::Premrna => "premrna",
+        }
+    }
+}
+
+impl std::str::FromStr for UnsplicedMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(UnsplicedMode::None),
+            "intron" => Ok(UnsplicedMode::Intron),
+            "premrna" => Ok(UnsplicedMode::Premrna),
+            other => Err(format!(
+                "unknown unspliced mode {other:?} (expected none, intron or premrna)"
+            )),
+        }
+    }
+}
+
+/// Suffix that marks an unspliced target, followed by an ordinal from the
+/// second interval of a gene on (`G-I`, `G-I1`, `G-I2`, ...). This is the
+/// naming `pyroe make-splici` / `make-spliceu` use, so `t2g_3col.tsv` and
+/// downstream tooling written for alevin-fry read these indices as they are.
+pub const UNSPLICED_SUFFIX: &str = "-I";
+
+/// One unspliced target: a genomic interval of one gene, read on the gene's
+/// strand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsplicedTarget {
+    pub name: String,
+    pub gene_id: String,
+    pub seqname: String,
+    pub strand: Strand,
+    /// 0-based half-open. `end` may exceed the sequence length when a flank
+    /// runs off the end of a chromosome; extraction clips it.
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Derive the unspliced targets of every gene, named deterministically.
+///
+/// * `Intron`: the gene's merged introns, each extended by `flank` bases on
+///   both sides (clipped at 0 here and at the sequence end on extraction), then
+///   merged again so flanks that meet across a short exon become one target.
+///   With `flank = L - 1` for reads of length `L`, any read with at least one
+///   intronic base lies wholly inside a target, so its unspliced placement
+///   scores as well as its genome placement and it is not lost to a decoy.
+/// * `Premrna`: the gene body; `flank` is ignored.
+///
+/// Genes without an intron get no target in either mode (their unspliced form
+/// would duplicate a mature transcript). Names are `<gene_id>-I`, then
+/// `<gene_id>-I1`, `-I2`, ... over a gene's intervals in annotation order, then
+/// by start, across all the sequences a `gene_id` appears on.
+pub fn unspliced_targets(
+    ann: &Annotation,
+    mode: UnsplicedMode,
+    flank: u64,
+) -> Vec<UnsplicedTarget> {
+    let mut out = Vec::new();
+    let mut ordinal: HashMap<&str, usize> = HashMap::new();
+    for gene in &ann.genes {
+        let intervals = match mode {
+            UnsplicedMode::None => return out,
+            UnsplicedMode::Intron => merge_intervals(
+                merged_introns(gene)
+                    .into_iter()
+                    .map(|(s, e)| (s.saturating_sub(flank), e.saturating_add(flank)))
+                    .collect(),
+            ),
+            UnsplicedMode::Premrna => gene_body(gene).into_iter().collect(),
+        };
+        for (start, end) in intervals {
+            let n = ordinal.entry(gene.gene_id.as_str()).or_insert(0);
+            let name = if *n == 0 {
+                format!("{}{UNSPLICED_SUFFIX}", gene.gene_id)
+            } else {
+                format!("{}{UNSPLICED_SUFFIX}{n}", gene.gene_id)
+            };
+            *n += 1;
+            out.push(UnsplicedTarget {
+                name,
+                gene_id: gene.gene_id.clone(),
+                seqname: gene.seqname.clone(),
+                strand: gene.strand,
+                start,
+                end,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +468,88 @@ chr1\tt\texon\t5\t9\t.\t.\t.\tgene_id \"GX\"; transcript_id \"TX\";
     fn rejects_bad_coordinates() {
         let gtf = "chr1\tt\texon\t0\t10\t.\t+\t.\tgene_id \"G\"; transcript_id \"T\";\n";
         assert!(parse_gtf(gtf.as_bytes()).is_err());
+    }
+
+    fn targets(mode: UnsplicedMode, flank: u64) -> Vec<(String, String, u64, u64)> {
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        unspliced_targets(&a, mode, flank)
+            .into_iter()
+            .map(|t| (t.name, t.seqname, t.start, t.end))
+            .collect()
+    }
+
+    fn row(n: &str, c: &str, s: u64, e: u64) -> (String, String, u64, u64) {
+        (n.to_string(), c.to_string(), s, e)
+    }
+
+    #[test]
+    fn intron_targets_without_flank() {
+        assert_eq!(
+            targets(UnsplicedMode::Intron, 0),
+            vec![
+                row("G1-I", "chr1", 200, 300),
+                row("G1-I1", "chr1", 400, 600),
+                row("G3-I", "chr1", 950, 1100),
+                row("G4_PAR_Y-I", "chrY", 60, 120),
+            ]
+        );
+    }
+
+    #[test]
+    fn flanks_extend_clip_at_zero_and_merge_across_short_exons() {
+        // flank 50: G1's introns become 150..350 and 350..650, which meet
+        // across the 100-base exon 300..400 and merge; G4's flank would run
+        // before position 10 only at flank > 60, so use 70 to see the clip.
+        assert_eq!(
+            targets(UnsplicedMode::Intron, 50),
+            vec![
+                row("G1-I", "chr1", 150, 650),
+                row("G3-I", "chr1", 900, 1150),
+                row("G4_PAR_Y-I", "chrY", 10, 170),
+            ]
+        );
+        let t = targets(UnsplicedMode::Intron, 70);
+        assert_eq!(t[2], row("G4_PAR_Y-I", "chrY", 0, 190));
+    }
+
+    #[test]
+    fn premrna_targets_are_gene_bodies_of_intron_bearing_genes() {
+        assert_eq!(
+            targets(UnsplicedMode::Premrna, 1000),
+            vec![
+                row("G1-I", "chr1", 100, 1000),
+                row("G3-I", "chr1", 900, 1300),
+                row("G4_PAR_Y-I", "chrY", 10, 200),
+            ]
+        );
+        assert!(targets(UnsplicedMode::None, 10).is_empty());
+    }
+
+    #[test]
+    fn a_gene_on_two_sequences_gets_distinct_names() {
+        let gtf = "\
+chrX\tt\texon\t1\t10\t.\t+\t.\tgene_id \"P\"; transcript_id \"T\";
+chrX\tt\texon\t21\t30\t.\t+\t.\tgene_id \"P\"; transcript_id \"T\";
+chrY\tt\texon\t1\t10\t.\t+\t.\tgene_id \"P\"; transcript_id \"T\";
+chrY\tt\texon\t21\t30\t.\t+\t.\tgene_id \"P\"; transcript_id \"T\";
+";
+        let a = parse_gtf(gtf.as_bytes()).unwrap();
+        let names: Vec<String> = unspliced_targets(&a, UnsplicedMode::Intron, 0)
+            .into_iter()
+            .map(|t| format!("{}@{}", t.name, t.seqname))
+            .collect();
+        assert_eq!(names, ["P-I@chrX", "P-I1@chrY"]);
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_name() {
+        for m in [
+            UnsplicedMode::None,
+            UnsplicedMode::Intron,
+            UnsplicedMode::Premrna,
+        ] {
+            assert_eq!(m.as_str().parse::<UnsplicedMode>().unwrap(), m);
+        }
+        assert!("splici".parse::<UnsplicedMode>().is_err());
     }
 }
