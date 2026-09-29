@@ -55,6 +55,8 @@ use salmon_core::RefSeqs;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+pub mod unspliced;
+
 /// Basename (within the index directory) of the cDBG tiling files.
 const CDBG_PREFIX: &str = "cdbg";
 /// Basename (within the index directory) of the piscem index files.

@@ -1,0 +1,359 @@
+//! Unspliced (intronic / pre-mRNA) targets for total-RNA quantification.
+//!
+//! # Why
+//!
+//! Total (ribo-depleted) RNA-seq libraries carry a large share of nascent,
+//! not-yet-spliced RNA: typically half or more of the fragments fall in introns.
+//! With a transcripts-only index those fragments are either lost or, worse,
+//! forced onto whichever annotated isoform contains the intronic sequence,
+//! which is usually a `retained_intron` isoform. A genome decoy does not fix
+//! this: a fragment only goes to the decoy when its genome score is *strictly*
+//! greater than its best transcript score, so an intronic fragment that lies
+//! inside a retained-intron isoform ties and stays on the isoform.
+//!
+//! The remedy used by the single-cell tools (alevin-fry's *splici* /
+//! *spliceu* references, He et al. 2022) is to index the unspliced sequence of
+//! every gene next to its spliced transcripts, so pre-mRNA fragments have a
+//! target of their own and the EM apportions the shared (retained-intron)
+//! evidence between the two by abundance. This module derives those unspliced
+//! targets from a genome FASTA and a GTF, inside `salmon index`, following the
+//! conventions of `pyroe make-splici` so the resulting tables are familiar.
+//!
+//! # Coordinates
+//!
+//! GTF coordinates are 1-based and inclusive; everything here is 0-based and
+//! half-open (`[start, end)`), converted once at parse time.
+
+use std::collections::HashMap;
+use std::io::BufRead;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use salmon_core::genemap::extract_attr;
+
+/// A genomic interval, 0-based half-open `[start, end)`.
+pub type Interval = (u64, u64);
+
+/// Genomic strand of a gene.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Strand {
+    Plus,
+    Minus,
+}
+
+/// One gene's exon structure on one sequence and strand.
+///
+/// A `gene_id` that the annotation places on two sequences (GENCODE's PAR
+/// genes before the `_PAR_Y` suffix, for instance) yields two models: they
+/// share the id but not the coordinates.
+#[derive(Debug, Clone)]
+pub struct GeneModel {
+    pub gene_id: String,
+    pub seqname: String,
+    pub strand: Strand,
+    /// Exons of each transcript, sorted by start.
+    pub transcripts: Vec<Vec<Interval>>,
+}
+
+/// The parts of a GTF the unspliced targets need.
+#[derive(Debug, Default)]
+pub struct Annotation {
+    /// Gene models in order of first appearance in the GTF.
+    pub genes: Vec<GeneModel>,
+    /// `transcript_id` -> `gene_id`. When the GTF carries the version in its
+    /// own attribute (Ensembl: `transcript_id "ENST…"; transcript_version "2"`)
+    /// the versioned id `ENST….2` is recorded too, since that is how Ensembl
+    /// names the records of its cDNA FASTA.
+    pub tx_to_gene: HashMap<String, String>,
+    /// Exon records skipped because their strand was neither `+` nor `-`.
+    pub unstranded_exons: usize,
+}
+
+impl Annotation {
+    /// The gene of transcript `name`, trying the name as given and then with a
+    /// trailing `.<digits>` version removed.
+    pub fn gene_of(&self, name: &str) -> Option<&str> {
+        self.tx_to_gene
+            .get(name)
+            .or_else(|| {
+                self.tx_to_gene
+                    .get(salmon_core::genemap::strip_tx_version(name))
+            })
+            .map(String::as_str)
+    }
+}
+
+/// Read the exon records of a GTF (optionally compressed).
+pub fn read_gtf(path: &Path) -> Result<Annotation> {
+    let reader = salmon_core::compress::open_maybe_compressed(path)
+        .with_context(|| format!("opening GTF {}", path.display()))?;
+    parse_gtf(reader).with_context(|| format!("parsing GTF {}", path.display()))
+}
+
+/// Parse the `exon` records of a GTF. Only exon lines are read: a gene's
+/// introns and body are both derived from its transcripts' exons, which is
+/// what `pyroe make-splici` does too, and it spares us from trusting `gene` /
+/// `transcript` lines that not every annotation provides.
+pub fn parse_gtf<R: BufRead>(reader: R) -> Result<Annotation> {
+    let mut ann = Annotation::default();
+    // (gene_id, seqname, strand) -> index into `ann.genes`
+    let mut gene_index: HashMap<(String, String, Strand), usize> = HashMap::new();
+    // per gene model: transcript_id -> index into its `transcripts`
+    let mut tx_index: Vec<HashMap<String, usize>> = Vec::new();
+
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.splitn(9, '\t').collect();
+        if cols.len() < 9 || cols[2] != "exon" {
+            continue;
+        }
+        let attrs = cols[8];
+        let (Some(gene_id), Some(tx_id)) = (
+            extract_attr(attrs, "gene_id"),
+            extract_attr(attrs, "transcript_id"),
+        ) else {
+            continue;
+        };
+        let parse = |s: &str| -> Result<u64> {
+            s.parse::<u64>()
+                .with_context(|| format!("line {}: invalid coordinate {s:?}", lineno + 1))
+        };
+        let (start, end) = (parse(cols[3])?, parse(cols[4])?);
+        if start == 0 || end < start {
+            bail!(
+                "line {}: invalid exon coordinates {start}..{end} (GTF is 1-based, start <= end)",
+                lineno + 1
+            );
+        }
+        let strand = match cols[6] {
+            "+" => Strand::Plus,
+            "-" => Strand::Minus,
+            _ => {
+                ann.unstranded_exons += 1;
+                continue;
+            }
+        };
+
+        if let Some(v) = extract_attr(attrs, "transcript_version") {
+            if salmon_core::genemap::strip_tx_version(&tx_id) == tx_id {
+                ann.tx_to_gene
+                    .entry(format!("{tx_id}.{v}"))
+                    .or_insert_with(|| gene_id.clone());
+            }
+        }
+        ann.tx_to_gene
+            .entry(tx_id.clone())
+            .or_insert_with(|| gene_id.clone());
+
+        let key = (gene_id, cols[0].to_string(), strand);
+        let gi = match gene_index.get(&key) {
+            Some(&gi) => gi,
+            None => {
+                ann.genes.push(GeneModel {
+                    gene_id: key.0.clone(),
+                    seqname: key.1.clone(),
+                    strand,
+                    transcripts: Vec::new(),
+                });
+                tx_index.push(HashMap::new());
+                gene_index.insert(key, ann.genes.len() - 1);
+                ann.genes.len() - 1
+            }
+        };
+        let gene = &mut ann.genes[gi];
+        let ti = *tx_index[gi].entry(tx_id).or_insert_with(|| {
+            gene.transcripts.push(Vec::new());
+            gene.transcripts.len() - 1
+        });
+        // 1-based inclusive -> 0-based half-open
+        gene.transcripts[ti].push((start - 1, end));
+    }
+
+    for gene in &mut ann.genes {
+        for exons in &mut gene.transcripts {
+            exons.sort_unstable();
+        }
+    }
+    if ann.genes.is_empty() {
+        bail!(
+            "no stranded exon records carrying both gene_id and transcript_id were found \
+             (a GTF is required; GFF3 is not supported for unspliced targets)"
+        );
+    }
+    Ok(ann)
+}
+
+/// Sort and merge overlapping or book-ended intervals.
+pub fn merge_intervals(mut v: Vec<Interval>) -> Vec<Interval> {
+    v.sort_unstable();
+    let mut out: Vec<Interval> = Vec::with_capacity(v.len());
+    for (s, e) in v {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// A transcript's introns: the gaps between its (sorted) exons. Overlapping or
+/// abutting exons leave no gap.
+fn transcript_introns(exons: &[Interval], out: &mut Vec<Interval>) {
+    let mut reach: Option<u64> = None;
+    for &(s, e) in exons {
+        if let Some(r) = reach {
+            if s > r {
+                out.push((r, s));
+            }
+        }
+        reach = Some(reach.map_or(e, |r| r.max(e)));
+    }
+}
+
+/// The union of the introns of every transcript of `gene`, merged.
+///
+/// This is the *splici* definition: an interval is intronic if it is an intron
+/// of at least one transcript, even when another transcript of the same gene
+/// (typically a retained-intron isoform) covers it with an exon. Those shared
+/// stretches are exactly the ambiguity the EM has to resolve, and they are
+/// resolved using the evidence each target has elsewhere.
+pub fn merged_introns(gene: &GeneModel) -> Vec<Interval> {
+    let mut v = Vec::new();
+    for exons in &gene.transcripts {
+        transcript_introns(exons, &mut v);
+    }
+    merge_intervals(v)
+}
+
+/// The gene body (first exon start to last exon end) when the gene has at
+/// least one intron; `None` for a gene whose transcripts are all single-exon
+/// and contiguous, whose "pre-mRNA" would be a copy of its mature transcript.
+pub fn gene_body(gene: &GeneModel) -> Option<Interval> {
+    if merged_introns(gene).is_empty() {
+        return None;
+    }
+    let start = gene
+        .transcripts
+        .iter()
+        .filter_map(|t| t.first())
+        .map(|e| e.0)
+        .min()?;
+    let end = gene.transcripts.iter().flatten().map(|e| e.1).max()?;
+    Some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic GTF covering the awkward cases: two transcripts with a
+    /// retained intron, a single-exon gene, genes overlapping on opposite
+    /// strands, a mitochondrial gene, and a GENCODE `_PAR_Y` gene.
+    pub(crate) const GTF: &str = "\
+##description: synthetic
+chr1\tt\tgene\t101\t1000\t.\t+\t.\tgene_id \"G1\";
+chr1\tt\texon\t101\t200\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1a\";
+chr1\tt\texon\t301\t400\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1a\";
+chr1\tt\texon\t601\t1000\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1a\";
+chr1\tt\texon\t101\t400\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1ri\"; transcript_type \"retained_intron\";
+chr1\tt\texon\t601\t700\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1ri\";
+chr1\tt\texon\t1201\t1500\t.\t+\t.\tgene_id \"G2\"; transcript_id \"T2\";
+chr1\tt\texon\t901\t950\t.\t-\t.\tgene_id \"G3\"; transcript_id \"T3\";
+chr1\tt\texon\t1101\t1300\t.\t-\t.\tgene_id \"G3\"; transcript_id \"T3\";
+chrM\tt\texon\t1\t500\t.\t+\t.\tgene_id \"MT1\"; transcript_id \"TM1\";
+chrY\tt\texon\t11\t60\t.\t+\t.\tgene_id \"G4_PAR_Y\"; transcript_id \"T4_PAR_Y\";
+chrY\tt\texon\t121\t200\t.\t+\t.\tgene_id \"G4_PAR_Y\"; transcript_id \"T4_PAR_Y\";
+chr1\tt\texon\t5\t9\t.\t.\t.\tgene_id \"GX\"; transcript_id \"TX\";
+";
+
+    fn gene<'a>(a: &'a Annotation, id: &str) -> &'a GeneModel {
+        a.genes.iter().find(|g| g.gene_id == id).unwrap()
+    }
+
+    #[test]
+    fn parses_exons_into_gene_models() {
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        let ids: Vec<&str> = a.genes.iter().map(|g| g.gene_id.as_str()).collect();
+        assert_eq!(ids, ["G1", "G2", "G3", "MT1", "G4_PAR_Y"]);
+        let g1 = gene(&a, "G1");
+        assert_eq!(g1.strand, Strand::Plus);
+        assert_eq!(g1.transcripts.len(), 2);
+        // 1-based inclusive 101..200 -> 0-based half-open 100..200
+        assert_eq!(g1.transcripts[0], vec![(100, 200), (300, 400), (600, 1000)]);
+        assert_eq!(gene(&a, "G3").strand, Strand::Minus);
+        assert_eq!(a.unstranded_exons, 1);
+        assert_eq!(a.gene_of("T1ri"), Some("G1"));
+        assert_eq!(a.gene_of("T4_PAR_Y"), Some("G4_PAR_Y"));
+        assert_eq!(a.gene_of("nope"), None);
+    }
+
+    #[test]
+    fn transcript_version_attribute_is_honoured() {
+        let gtf = "1\te\texon\t1\t10\t.\t+\t.\tgene_id \"ENSG1\"; gene_version \"3\"; \
+                   transcript_id \"ENST1\"; transcript_version \"2\";\n";
+        let a = parse_gtf(gtf.as_bytes()).unwrap();
+        assert_eq!(a.gene_of("ENST1.2"), Some("ENSG1"));
+        assert_eq!(a.gene_of("ENST1"), Some("ENSG1"));
+        // a version the GTF does not know still matches with the version dropped
+        assert_eq!(a.gene_of("ENST1.9"), Some("ENSG1"));
+    }
+
+    #[test]
+    fn introns_are_the_union_over_transcripts() {
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        // T1a: introns 200..300 and 400..600; T1ri: 400..600 (its first exon
+        // retains 200..300). The union keeps the retained intron.
+        assert_eq!(merged_introns(gene(&a, "G1")), vec![(200, 300), (400, 600)]);
+        assert_eq!(gene_body(gene(&a, "G1")), Some((100, 1000)));
+        assert_eq!(merged_introns(gene(&a, "G3")), vec![(950, 1100)]);
+        assert_eq!(merged_introns(gene(&a, "G4_PAR_Y")), vec![(60, 120)]);
+    }
+
+    #[test]
+    fn single_exon_genes_have_no_unspliced_form() {
+        let a = parse_gtf(GTF.as_bytes()).unwrap();
+        for id in ["G2", "MT1"] {
+            assert!(merged_introns(gene(&a, id)).is_empty(), "{id}");
+            assert_eq!(gene_body(gene(&a, id)), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn merge_handles_overlap_and_abutment() {
+        assert_eq!(
+            merge_intervals(vec![(10, 20), (0, 5), (5, 8), (15, 30), (40, 41)]),
+            vec![(0, 8), (10, 30), (40, 41)]
+        );
+        assert!(merge_intervals(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn overlapping_exons_leave_no_intron() {
+        let g = GeneModel {
+            gene_id: "g".into(),
+            seqname: "c".into(),
+            strand: Strand::Plus,
+            transcripts: vec![vec![(0, 50), (40, 100), (100, 120), (150, 200)]],
+        };
+        assert_eq!(merged_introns(&g), vec![(120, 150)]);
+    }
+
+    #[test]
+    fn rejects_annotation_without_exons() {
+        let err =
+            parse_gtf("chr1\tt\tgene\t1\t10\t.\t+\t.\tgene_id \"G\";\n".as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("no stranded exon records"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_coordinates() {
+        let gtf = "chr1\tt\texon\t0\t10\t.\t+\t.\tgene_id \"G\"; transcript_id \"T\";\n";
+        assert!(parse_gtf(gtf.as_bytes()).is_err());
+    }
+}
