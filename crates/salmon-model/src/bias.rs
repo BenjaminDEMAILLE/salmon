@@ -135,19 +135,26 @@ pub fn corrected_effective_length_full(
     )
 }
 
-/// Number of fragment-start positions a long unspliced target keeps in the
-/// bias sweeps. Past this, positions are sampled systematically (see
+/// Position stride of the bias sweeps over an unspliced target (see
 /// [`unspliced_position_stride`]).
-pub const UNSPLICED_BIAS_POSITIONS: usize = 50_000;
+pub const UNSPLICED_BIAS_STRIDE: usize = 16;
+
+/// Fewest fragment starts an unspliced target keeps in the bias sweeps; the
+/// stride shrinks below [`UNSPLICED_BIAS_STRIDE`] for targets too short to
+/// provide them.
+pub const UNSPLICED_BIAS_MIN_STARTS: usize = 64;
 
 /// Position stride for the bias sweeps of an unspliced target of length `len`:
-/// `ceil(len / UNSPLICED_BIAS_POSITIONS)`, so a 2 Mb intron target is visited
-/// at 50,000 evenly spaced starts rather than two million. An intron target is
-/// far longer than any fragment, so its bias-corrected effective length is
-/// essentially its length times the mean per-start bias factor, which
-/// systematic sampling estimates without bias. Spliced targets always use 1.
+/// every 16th fragment start, weighted by 16 (fewer for targets under 1 kb).
+///
+/// A fragment's GC content and end contexts change little when its start moves
+/// by a few bases, since it spans ~250 of them, so the per-start bias factor is
+/// smooth and systematic sampling at a stride well below the fragment length
+/// estimates the full sweep closely (see the tests). Unspliced targets are
+/// what makes the sweep expensive: 2.4 Gb of them against 1.5 Gb of
+/// transcripts for GENCODE v50 intron targets. Spliced targets always use 1.
 pub fn unspliced_position_stride(len: usize) -> usize {
-    len.div_ceil(UNSPLICED_BIAS_POSITIONS).max(1)
+    (len / UNSPLICED_BIAS_MIN_STARTS).clamp(1, UNSPLICED_BIAS_STRIDE)
 }
 
 /// [`corrected_effective_length_full`] with the scalar (GC) sweep visiting only
@@ -493,6 +500,13 @@ mod tests {
     /// A GC-biased ratio model, an FLD around 250 and a random sequence with
     /// GC-rich and GC-poor stretches: the ingredients of a scalar GC sweep.
     fn gc_fixture(len: usize) -> (Vec<u8>, Vec<u32>, GcFragModel, Vec<f64>, usize, usize) {
+        gc_fixture_blocks(len, 3000)
+    }
+
+    fn gc_fixture_blocks(
+        len: usize,
+        block: usize,
+    ) -> (Vec<u8>, Vec<u32>, GcFragModel, Vec<f64>, usize, usize) {
         use crate::gcbias::{gc_prefix, gc_ratio, DEFAULT_COND_BINS, DEFAULT_GC_BINS};
         let mut x = 0x1234_5678u64;
         let seq: Vec<u8> = (0..len)
@@ -501,8 +515,8 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let r = (x >> 33) % 100;
-                // alternate 3 kb GC-rich and GC-poor stretches
-                let gc_rich = (i / 3000) % 2 == 0;
+                // alternate GC-rich and GC-poor stretches of `block` bases
+                let gc_rich = (i / block).is_multiple_of(2);
                 match (gc_rich, r) {
                     (true, 0..=34) | (false, 0..=14) => b'G',
                     (true, 35..=69) | (false, 15..=29) => b'C',
@@ -544,26 +558,32 @@ mod tests {
         assert_eq!(full.to_bits(), one.to_bits());
     }
 
-    /// On a target far longer than a fragment, sampling every s-th start and
-    /// weighting by s estimates the full sweep closely.
+    /// Sampling every 16th start and weighting by 16 estimates the full sweep
+    /// closely, for a typical 5 kb intron target and a long one alike, with
+    /// GC content switching every 300 bases (the scale of an Alu repeat).
     #[test]
-    fn position_stride_estimates_long_targets() {
-        let len = 400_000;
-        let (seq, prefix, model, cdf, lo, hi) = gc_fixture(len);
-        let bias = BiasInputs {
-            seq: None,
-            gc: Some((&model, GcView::Dense(&prefix))),
-            pos: None,
-        };
-        let elen = len as f64 - 250.0;
-        let full = corrected_effective_length_full(&seq, &cdf, lo, hi, &bias, elen, 5, false);
-        let s = unspliced_position_stride(len);
-        assert_eq!(s, 8);
-        let est = corrected_effective_length_strided(&seq, &cdf, lo, hi, &bias, elen, 5, false, s);
-        let rel = (est - full).abs() / full;
-        assert!(rel < 1e-3, "strided {est} vs exact {full} ({rel:e})");
-        // and the bias did move the length, so the test measures something
-        assert!((full - elen).abs() / elen > 0.01, "{full} vs {elen}");
+    fn position_stride_estimates_intron_targets() {
+        for len in [5_000usize, 100_000] {
+            let (seq, prefix, model, cdf, lo, hi) = gc_fixture_blocks(len, 300);
+            let bias = BiasInputs {
+                seq: None,
+                gc: Some((&model, GcView::Dense(&prefix))),
+                pos: None,
+            };
+            let elen = len as f64 - 250.0;
+            let full = corrected_effective_length_full(&seq, &cdf, lo, hi, &bias, elen, 5, false);
+            let s = unspliced_position_stride(len);
+            assert_eq!(s, UNSPLICED_BIAS_STRIDE);
+            let est =
+                corrected_effective_length_strided(&seq, &cdf, lo, hi, &bias, elen, 5, false, s);
+            let rel = (est - full).abs() / full;
+            assert!(
+                rel < 2e-3,
+                "len {len}: strided {est} vs exact {full} ({rel:e})"
+            );
+            // and the bias did move the length, so the test measures something
+            assert!((full - elen).abs() / elen > 0.01, "{full} vs {elen}");
+        }
     }
 
     /// The expected GC and sequence models: stride 1 is exact, a stride on a
@@ -631,11 +651,12 @@ mod tests {
     }
 
     #[test]
-    fn unspliced_stride_keeps_short_targets_exact() {
+    fn unspliced_stride_keeps_short_targets_dense() {
         assert_eq!(unspliced_position_stride(0), 1);
-        assert_eq!(unspliced_position_stride(UNSPLICED_BIAS_POSITIONS), 1);
-        assert_eq!(unspliced_position_stride(UNSPLICED_BIAS_POSITIONS + 1), 2);
-        assert_eq!(unspliced_position_stride(2_000_000), 40);
+        assert_eq!(unspliced_position_stride(100), 1);
+        assert_eq!(unspliced_position_stride(640), 10);
+        assert_eq!(unspliced_position_stride(5_000), UNSPLICED_BIAS_STRIDE);
+        assert_eq!(unspliced_position_stride(2_000_000), UNSPLICED_BIAS_STRIDE);
     }
     use crate::posbias::compute_length_quantiles;
     use crate::seqbias::fld_cdf_and_bounds;

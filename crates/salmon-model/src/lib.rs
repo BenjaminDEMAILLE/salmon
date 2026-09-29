@@ -62,7 +62,7 @@ pub mod spline;
 pub use bias::{
     build_expected_pos, corrected_effective_length_full, corrected_effective_length_strided,
     positional_factor, positional_factor_into, unspliced_position_stride, BiasInputs,
-    UNSPLICED_BIAS_POSITIONS,
+    UNSPLICED_BIAS_MIN_STARTS, UNSPLICED_BIAS_STRIDE,
 };
 pub use fld::FragLengthSource;
 pub use fld::{
