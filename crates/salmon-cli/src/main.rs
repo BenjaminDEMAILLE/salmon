@@ -1446,6 +1446,10 @@ fn run_deterministic(
     // `bias_targets` seam on `requant_options` exists for the alignment/RAD
     // drivers, which have no index to fall back on.
     let mut q = requant_options(&map_opts, &rad_path, out_dir, None);
+    // An index built with `--unspliced` adds the spliced / unspliced summary;
+    // the RAD carries the index's reference numbering, so its table applies.
+    q.splice_annotation = salmon_index::load_splice_annotation(&map_opts.index_dir)
+        .context("reading the index's splicing annotation")?;
 
     // Phase 1 — map once, write the RAD (bakes the deterministic FLD + resolved
     // library format), skipping the online EM: quantification happens in phase 2.

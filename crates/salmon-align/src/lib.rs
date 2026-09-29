@@ -296,6 +296,11 @@ pub struct AlignQuantOptions {
     /// processed/mapped fragment counts here as it runs so the caller can drive
     /// a live progress display. `None` (the default) disables sharing.
     pub progress: Option<std::sync::Arc<salmon_core::ProgressCounters>>,
+    /// Splicing annotation of the index the fragments were mapped to (an index
+    /// built with `salmon index --unspliced`). When set, a RAD quantification
+    /// also writes the gene-level spliced / unspliced / ambiguous summary. Set
+    /// by reads-mode `--deterministic`, whose RAD shares the index numbering.
+    pub splice_annotation: Option<salmon_core::splicing::SpliceAnnotation>,
 }
 
 impl AlignQuantOptions {
@@ -350,6 +355,7 @@ impl AlignQuantOptions {
             num_gibbs_samples: 0,
             thinning_factor: 16,
             progress: None,
+            splice_annotation: None,
         }
     }
 }
@@ -440,6 +446,9 @@ pub struct AlignQuantResult {
     pub peak_rss_kb: u64,
     /// structured run diagnostics / bad-input warnings (also emitted to the log)
     pub diagnostics: Vec<salmon_core::Diagnostic>,
+    /// gene-level spliced / unspliced / ambiguous counts (see
+    /// [`AlignQuantOptions::splice_annotation`])
+    pub splicing: Option<salmon_core::splicing::SplicingSummary>,
 }
 
 /// Current local time as an asctime-style string, matching salmon's timestamps.
@@ -2653,6 +2662,7 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
         total_seconds: opts.prior_seconds + run_timer.elapsed().as_secs_f64(),
         peak_rss_kb: salmon_core::peak_rss_kb(),
         diagnostics,
+        splicing: None,
     };
     write_outputs(opts, &result)?;
     timer.mark("output");
@@ -2755,6 +2765,11 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
         }
         w.flush()?;
     }
+    if let Some(sp) = &res.splicing {
+        let path = dir.join(salmon_core::splicing::USA_FILE);
+        salmon_core::splicing::write_usa_tsv(&path, sp, opts.sig_digits as usize)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
 
     /// Shape of the positional-bias model: one model per transcript length
     /// class, each binned over the transcript's relative position. Reported as
@@ -2854,6 +2869,9 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
         total_time_seconds: f64,
         peak_rss_kb: u64,
         diagnostics: Vec<salmon_core::Diagnostic>,
+        /// present only for an index built with `--unspliced`
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unspliced: Option<salmon_core::splicing::UnsplicedMeta>,
         call: String,
         start_time: String,
         end_time: String,
@@ -3128,6 +3146,7 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
             d.extend(opts.extra_diagnostics.iter().cloned());
             d
         },
+        unspliced: res.splicing.as_ref().map(Into::into),
         call: "quant".to_string(),
         start_time: res.start_time.clone(),
         end_time: asctime_now(),

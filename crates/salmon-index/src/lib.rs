@@ -1395,6 +1395,28 @@ pub struct SalmonIndex {
     refseq_loaded: bool,
 }
 
+/// The splicing annotation (`t2g_3col.tsv`) of an index built with
+/// `--unspliced`; `None` for any other index. Reads only `info.json` and the
+/// table, not the index itself, so a requant pass can call it cheaply.
+pub fn load_splice_annotation(
+    dir: impl AsRef<Path>,
+) -> Result<Option<salmon_core::splicing::SpliceAnnotation>> {
+    let dir = dir.as_ref();
+    let info = read_info(dir)?;
+    let Some(u) = &info.unspliced else {
+        return Ok(None);
+    };
+    let path = dir.join(&u.t2g_file);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let ann = salmon_core::splicing::SpliceAnnotation::parse(
+        &u.mode,
+        &text,
+        &path.display().to_string(),
+    )?;
+    Ok(Some(ann))
+}
+
 /// Load just the per-reference forward sequences from an index directory, in
 /// transcript-id order (decoys included), without loading the (multi-GB) SSHash
 /// dictionary. Reads only `refseq.bin` + `refseq_offsets.json`. Used to feed
@@ -1816,6 +1838,17 @@ mod tests {
         );
 
         let idx = SalmonIndex::load(&out).unwrap();
+        let names: Vec<&str> = (0..idx.num_refs()).map(|i| idx.ref_name(i)).collect();
+        let table = load_splice_annotation(&out)
+            .unwrap()
+            .expect("splice annotation")
+            .table(&names, 0..6)
+            .unwrap();
+        assert_eq!(table.genes, ["G1", "G2"]);
+        assert_eq!(table.target_counts(), (3, 3));
+        assert!(load_splice_annotation(tmp.path().join("plain"))
+            .unwrap()
+            .is_none());
         let tid = |n: &str| (0..idx.num_refs()).find(|&i| idx.ref_name(i) == n).unwrap() as u32;
         // G1 introns 1200..1500 and 1700..2200, 30-base flanks, 0-based.
         assert_eq!(idx.ref_seq(tid("G1-I")), &chr1.as_bytes()[1170..1530]);

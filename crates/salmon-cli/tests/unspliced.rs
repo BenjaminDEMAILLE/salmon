@@ -137,3 +137,142 @@ fn unspliced_options_are_validated() {
     ]);
     assert!(e.contains("without --unspliced"), "{e}");
 }
+
+fn revcomp(s: &str) -> String {
+    s.chars()
+        .rev()
+        .map(|c| match c {
+            'A' => 'T',
+            'C' => 'G',
+            'G' => 'C',
+            _ => 'A',
+        })
+        .collect()
+}
+
+/// Inward 2x75 pairs of 250-base fragments: `n_spliced` from the mature
+/// transcript, `n_pre` from the intron (1000..2000) of the fixture gene.
+fn reads(dir: &Path, n_spliced: usize, n_pre: usize) -> (PathBuf, PathBuf) {
+    let chr = sequence(7, 4000);
+    let tx = format!("{}{}", &chr[500..1000], &chr[2000..2500]);
+    let intron = &chr[1000..2000];
+    let (mut r1, mut r2) = (String::new(), String::new());
+    let q = "I".repeat(75);
+    let mut id = 0;
+    for (src, n) in [(tx.as_str(), n_spliced), (intron, n_pre)] {
+        for i in 0..n {
+            let start = (i * 37) % (src.len() - 250);
+            let frag = &src[start..start + 250];
+            r1.push_str(&format!("@f{id}\n{}\n+\n{q}\n", &frag[..75]));
+            r2.push_str(&format!("@f{id}\n{}\n+\n{q}\n", revcomp(&frag[175..])));
+            id += 1;
+        }
+    }
+    let (p1, p2) = (dir.join("r1.fq"), dir.join("r2.fq"));
+    std::fs::write(&p1, r1).unwrap();
+    std::fs::write(&p2, r2).unwrap();
+    (p1, p2)
+}
+
+fn build_unspliced_index(dir: &Path, fx: &Fx) -> PathBuf {
+    let idx = dir.join("idx");
+    let out = salmon(&[
+        os("index"),
+        os("-t"),
+        fx.txome.as_os_str(),
+        os("-i"),
+        idx.as_os_str(),
+        os("-p"),
+        os("1"),
+        os("--unspliced"),
+        os("intron"),
+        os("--genome"),
+        fx.genome.as_os_str(),
+        os("--gtf"),
+        fx.gtf.as_os_str(),
+        os("--readLength"),
+        os("75"),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    idx
+}
+
+fn num_reads(quant_sf: &Path) -> f64 {
+    std::fs::read_to_string(quant_sf)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| l.rsplit('\t').next().unwrap().parse::<f64>().unwrap())
+        .sum()
+}
+
+/// Both inference paths write `quant.genes.usa.tsv` and the `unspliced` block
+/// of `meta_info.json`, and the three columns add up to `quant.sf`.
+#[test]
+fn quant_writes_the_spliced_unspliced_summary_on_both_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    let idx = build_unspliced_index(tmp.path(), &fx);
+    let (r1, r2) = reads(tmp.path(), 300, 200);
+    for (label, extra) in [("deterministic", None), ("online", Some("--online"))] {
+        let out = tmp.path().join(label);
+        let mut args = vec![
+            os("quant"),
+            os("-i"),
+            idx.as_os_str(),
+            os("-l"),
+            os("A"),
+            os("-1"),
+            r1.as_os_str(),
+            os("-2"),
+            r2.as_os_str(),
+            os("-p"),
+            os("2"),
+            os("-o"),
+            out.as_os_str(),
+        ];
+        if let Some(e) = extra {
+            args.push(os(e));
+        }
+        let o = salmon(&args);
+        assert!(
+            o.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let usa = std::fs::read_to_string(out.join("quant.genes.usa.tsv")).unwrap();
+        let mut lines = usa.lines();
+        assert_eq!(lines.next(), Some("Name\tSpliced\tUnspliced\tAmbiguous"));
+        let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(row[0], "G1");
+        let (s, u, a): (f64, f64, f64) = (
+            row[1].parse().unwrap(),
+            row[2].parse().unwrap(),
+            row[3].parse().unwrap(),
+        );
+        let total = num_reads(&out.join("quant.sf"));
+        assert!(
+            (s + u + a - total).abs() < 0.01 * total,
+            "{label}: {s}+{u}+{a} vs {total}"
+        );
+        // Every simulated intronic fragment lies inside the intron target, and
+        // fragments that stay within the flank are compatible with both forms.
+        assert!(u > 150.0 && u < 205.0, "{label}: unspliced {u}");
+        assert!(s > 150.0, "{label}: spliced {s}");
+
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("aux_info/meta_info.json")).unwrap(),
+        )
+        .unwrap();
+        let m = &meta["unspliced"];
+        assert_eq!(m["mode"], "intron", "{label}");
+        assert_eq!(m["num_unspliced_targets"], 1);
+        let f = m["unspliced_fraction"].as_f64().unwrap();
+        assert!((f - u / (s + u + a)).abs() < 1e-3, "{label}: {f}");
+    }
+}

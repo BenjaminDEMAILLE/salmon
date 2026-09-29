@@ -396,6 +396,9 @@ pub struct QuantResult {
     pub detected_library_type: Option<String>,
     /// structured run diagnostics / bad-input warnings (also emitted to the log)
     pub diagnostics: Vec<Diagnostic>,
+    /// gene-level spliced / unspliced / ambiguous counts; `Some` only for an
+    /// index built with `--unspliced` (and a run that quantified)
+    pub splicing: Option<salmon_core::splicing::SplicingSummary>,
 }
 
 /// Run quantification end-to-end, writing outputs and returning the results.
@@ -1326,6 +1329,25 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
     // ---- posterior uncertainty (bootstrap / Gibbs) + ambiguity --------------
     // The packed CSR layout (piscem-infer style) makes these parallel-friendly.
     let ambig = salmon_infer::ambiguity_counts(&packed);
+    // Spliced / unspliced / ambiguous split, for an index built with
+    // `--unspliced`: the same final E-step as `counts`, filed per gene.
+    let splicing = if opts.skip_quant {
+        None
+    } else {
+        match salmon_index::load_splice_annotation(&opts.index_dir)? {
+            Some(ann) => {
+                let names: Vec<&str> = (0..num_refs).map(|i| salmon.ref_name(i)).collect();
+                let rows = salmon_core::quant_row_indices(
+                    num_refs,
+                    salmon.info().first_decoy_index,
+                    salmon.info().num_decoys,
+                );
+                let table = ann.table(&names, rows)?;
+                Some(salmon_infer::splicing_summary(&packed, &counts, &table))
+            }
+            None => None,
+        }
+    };
     // Same `posterior` the packed layout was built for, so the run cannot decide
     // it needs Gibbs after the weights it reads were skipped.
     let bootstraps: Vec<Vec<f64>> = match posterior {
@@ -1469,6 +1491,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
         peak_rss_kb: salmon_core::peak_rss_kb(),
         detected_library_type,
         diagnostics,
+        splicing,
     };
 
     tracing::info!("writing results to {}", opts.output_dir.display());

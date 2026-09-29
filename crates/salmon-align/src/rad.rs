@@ -2338,6 +2338,28 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
         salmon_model::compute_length_quantiles(&lengths, salmon_model::NUM_LENGTH_CLASSES);
 
     let ambig = salmon_infer::ambiguity_counts(&packed);
+    // Spliced / unspliced / ambiguous split, when the driver passed the
+    // splicing annotation of the (unspliced) index this RAD was mapped to.
+    let splicing = match (&opts.splice_annotation, opts.skip_quant) {
+        (Some(ann), false) => {
+            let (first_decoy, num_decoys) = provenance
+                .index
+                .as_ref()
+                .map(|ix| {
+                    (
+                        ix.first_decoy_index.map(|v| v as usize),
+                        ix.num_decoys.unwrap_or(0) as usize,
+                    )
+                })
+                .unwrap_or((None, 0));
+            let rows = salmon_core::quant_row_indices(names.len(), first_decoy, num_decoys);
+            let table = ann
+                .table(&names, rows)
+                .context("aligning the index's t2g_3col.tsv to the RAD references")?;
+            Some(salmon_infer::splicing_summary(&packed, &counts, &table))
+        }
+        _ => None,
+    };
     let bootstraps: Vec<Vec<f64>> = if opts.skip_quant {
         Vec::new()
     } else if opts.num_bootstraps > 0 {
@@ -2440,6 +2462,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
         total_seconds: opts.prior_seconds + run_timer.elapsed().as_secs_f64(),
         peak_rss_kb: salmon_core::peak_rss_kb(),
         diagnostics,
+        splicing,
     };
     crate::write_outputs(opts, &result)?;
     timer.mark("output");
