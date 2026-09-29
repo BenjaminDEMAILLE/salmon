@@ -1,0 +1,123 @@
+---
+title: Total RNA-seq (unspliced targets)
+description: Quantify rRNA-depleted total RNA with an index that also holds each gene's unspliced sequence, so pre-mRNA fragments stop inflating retained-intron isoforms.
+---
+
+A poly(A)-selected library is mostly mature mRNA. A **total RNA** library
+(ribosomal RNA depleted) is not: nascent, not-yet-spliced RNA typically makes up
+half or more of its fragments, most of them intronic.
+
+With a transcripts-only index those fragments either fail to map or are pushed
+onto whichever annotated isoform contains their sequence. Adding the genome as
+decoys (a *gentrome* index) catches the ones that align better to the genome,
+but not all of them: a fragment only goes to the decoy when its genome score is
+**strictly greater** than its best transcript score. A pre-mRNA fragment that
+lies inside a `retained_intron` isoform scores the same on both, the tie goes to
+the transcript, and the retained-intron isoform absorbs intronic signal. The
+isoform proportions, and anything derived from them (for example the
+`avgTxLength` offsets tximport passes to DESeq2), then follow the library's
+pre-mRNA content rather than its mature RNA.
+
+`salmon index --unspliced` gives those fragments a target of their own: it cuts
+each gene's unspliced sequence out of the genome and indexes it next to the
+transcripts, as alevin-fry does for single-nucleus data (the *splici* and
+*spliceu* references of `pyroe`). The EM then shares the ambiguous evidence
+between the mature isoforms and the unspliced target by abundance.
+
+## Building the index
+
+```sh
+# decoy-aware gentrome: transcripts first, then the genome
+zcat GRCh38.primary_assembly.genome.fa.gz | grep '^>' | cut -d ' ' -f 1 | tr -d '>' > decoys.txt
+cat gencode.v50.transcripts.fa.gz GRCh38.primary_assembly.genome.fa.gz > gentrome.fa.gz
+
+salmon index -t gentrome.fa.gz -d decoys.txt --gencode -p 16 -i salmon_index \
+  --unspliced intron \
+  --genome GRCh38.primary_assembly.genome.fa.gz \
+  --gtf gencode.v50.primary_assembly.annotation.gtf.gz \
+  --readLength 51
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--unspliced intron` | Each gene's introns (the union over its transcripts, so retained introns count as introns), merged, then extended by `--flank` bases on both sides and merged again. Targets are named `<gene>-I`, `<gene>-I1`, `<gene>-I2`, … |
+| `--unspliced premrna` | Each gene's full body, first exon start to last exon end, named `<gene>-I`. |
+| `--genome`, `--gtf` | The genome the targets are cut from and the annotation that defines them. Sequence names must match (first word of the FASTA header, GTF column 1). The genome may be the same file as the decoys. |
+| `--flank N` / `--readLength L` | Intron flank; `--readLength L` sets `L - 1`. With that flank, every read with at least one intronic base fits wholly inside an intron target, so it scores as well there as on the genome and is not lost to the decoy. (`pyroe` uses `L - 5`.) |
+
+Genes whose transcripts have no intron get no unspliced target. The targets are
+read on the gene's strand, so a stranded library keeps its strand information.
+They sit between the transcripts and the decoys in the index, and the index
+also records `t2g_3col.tsv`: `target<TAB>gene<TAB>S|U` for every quantified
+target, the same file `pyroe` writes.
+
+### Which mode
+
+`intron` keeps the unspliced targets off constitutive exons (apart from the
+flanks), so exonic fragments are still assigned to mature isoforms. `premrna`
+also offers each exonic fragment an unspliced home; it is the better model when
+pre-mRNA covers the gene body evenly, at the price of a larger index and of
+more fragments filed as *ambiguous* below. The benchmark in the pull request
+that introduced the option compares both.
+
+## Quantifying
+
+Nothing changes on the command line. With such an index, `quant.sf` lists the
+unspliced targets as extra rows, and two outputs are added:
+
+- `quant.genes.usa.tsv`: per gene, fragments filed as **Spliced** (compatible
+  only with the gene's transcripts), **Unspliced** (only with its unspliced
+  targets) and **Ambiguous** (both). Each class's fragments are shared between
+  genes by the final EM responsibilities, so the three columns add up to the
+  gene's `NumReads` in `quant.sf`. This is alevin-fry's USA split applied to
+  bulk EM counts.
+- an `unspliced` block in `aux_info/meta_info.json`, with the fraction of
+  assigned fragments filed under each status.
+
+## Downstream: tximport and DESeq2
+
+Map targets to genes with the index's `t2g_3col.tsv`. Two common choices:
+
+- **mature-mRNA expression and isoform-aware offsets**: import only the spliced
+  rows (status `S`), so `avgTxLength` is computed over the mature isoforms:
+
+  ```r
+  t2g <- read.delim(file.path(index, "t2g_3col.tsv"), header = FALSE,
+                    col.names = c("tx", "gene", "status"))
+  txi <- tximport(files, type = "salmon",
+                  tx2gene = t2g[t2g$status == "S", c("tx", "gene")])
+  ```
+
+- **all RNA from the gene**: keep every row. The unspliced targets then join
+  their gene and its counts include pre-mRNA; its `avgTxLength` then mixes
+  mature and unspliced lengths, which brings back the dependence on each
+  library's pre-mRNA content, so do not use those offsets for isoform-aware
+  length correction. `quant.genes.usa.tsv` gives the same totals split by
+  status.
+
+## Related option: `--decoyWinsTies`
+
+`salmon quant --decoyWinsTies` makes a decoy that *ties* the best transcript
+dominate it (`<=` instead of `<`). On a plain gentrome index this discards the
+intronic fragments that would have gone to retained-intron isoforms instead of
+keeping them. It is off by default and independent of `--unspliced`; the
+unspliced index is the more complete fix, since it counts those fragments
+instead of dropping them.
+
+## Costs and limits
+
+- **Index size and build time** grow with the unspliced sequence: roughly the
+  total intron length (`intron`) or gene-body length (`premrna`) of the
+  annotation, about half of the human genome for the latter. With the genome
+  already present as decoys the set of k-mers barely changes; the reference
+  store and the position tables grow.
+- **Overlapping genes** each get their own unspliced target over the shared
+  region; fragments there are shared by the EM like any multi-mapping fragment.
+  Antisense overlaps are separated by strand on stranded libraries only.
+- **Flank choice** trades exonic fragments near a splice site being called
+  ambiguous (longer flank) against intron-straddling fragments being lost to
+  the decoy (shorter flank).
+- The spliced/unspliced summary is written in reads mode (default and
+  `--online`). A standalone `--rad` requant or `-a` alignment input has no index
+  to read the table from; aggregate `quant.sf` with `t2g_3col.tsv` instead.
+- Only GTF annotations are read (`gene_id` and `transcript_id` on exon lines).
