@@ -366,6 +366,35 @@ struct IndexArgs {
     /// all-`A` reference is dropped).
     #[arg(short = 'n', long = "no-clip")]
     no_clip: bool,
+    /// Also index unspliced targets, for total-RNA (ribo-depleted) libraries:
+    /// `intron` adds each gene's merged introns plus a flank on both sides
+    /// (named `<gene>-I`, `<gene>-I1`, ..., as `pyroe make-splici`), `premrna`
+    /// adds each gene's full body (`<gene>-I`, as `make-spliceu`). Requires
+    /// --genome and --gtf; writes `t2g_3col.tsv` (target, gene, S|U) into the
+    /// index. `none` (default) builds the index exactly as without this option.
+    #[arg(
+        long = "unspliced",
+        default_value = "none",
+        value_parser = ["none", "intron", "premrna"]
+    )]
+    unspliced: String,
+    /// Genome FASTA the unspliced targets are cut from (--unspliced). Header
+    /// names (first word) must match the GTF sequence names.
+    #[arg(long = "genome", requires = "gtf")]
+    genome: Option<PathBuf>,
+    /// GTF annotation (optionally gzipped) defining genes, transcripts and
+    /// exons for --unspliced; also supplies the gene column of t2g_3col.tsv.
+    #[arg(long = "gtf", requires = "genome")]
+    gtf: Option<PathBuf>,
+    /// Flank, in bases, added to each side of the merged introns
+    /// (--unspliced intron). Use the read length minus one: every read with at
+    /// least one intronic base then fits wholly inside an intron target.
+    #[arg(long = "flank", conflicts_with = "read_length")]
+    flank: Option<u64>,
+    /// Read length of the libraries to quantify; sets --flank to
+    /// readLength - 1 (--unspliced intron).
+    #[arg(long = "readLength", value_parser = clap::value_parser!(u64).range(1..))]
+    read_length: Option<u64>,
 }
 
 #[derive(Args)]
@@ -969,11 +998,24 @@ fn run_index(args: IndexArgs) -> Result<()> {
     opts.decoys = args.decoys;
     opts.gencode = args.gencode;
     opts.clip_polya = !args.no_clip;
+    opts.unspliced = args
+        .unspliced
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    opts.genome = args.genome;
+    opts.gtf = args.gtf;
+    opts.flank = args.flank.or(args.read_length.map(|l| l - 1));
     let info = build_index(&opts).context("index build failed")?;
     println!(
         "indexed {} references (k={}, m={})",
         info.num_refs, info.k, info.m
     );
+    if let Some(u) = &info.unspliced {
+        println!(
+            "  of which {} spliced and {} unspliced ({}) targets; see {}",
+            u.num_spliced_targets, u.num_unspliced_targets, u.mode, u.t2g_file
+        );
+    }
     Ok(())
 }
 
