@@ -57,7 +57,7 @@ use tracing::{info, warn};
 
 pub mod unspliced;
 
-pub use unspliced::UnsplicedMode;
+pub use unspliced::{UnsplicedLayout, UnsplicedMode};
 
 /// Basename (within the index directory) of the cDBG tiling files.
 const CDBG_PREFIX: &str = "cdbg";
@@ -212,6 +212,8 @@ pub struct IndexBuildOptions {
     pub gtf: Option<PathBuf>,
     /// Flank added on both sides of each merged intron (`intron` mode only).
     pub flank: Option<u64>,
+    /// How the unspliced targets are held (see [`UnsplicedLayout`]).
+    pub unspliced_layout: UnsplicedLayout,
 }
 
 impl IndexBuildOptions {
@@ -239,6 +241,7 @@ impl IndexBuildOptions {
             genome: None,
             gtf: None,
             flank: None,
+            unspliced_layout: UnsplicedLayout::Auto,
         }
     }
 }
@@ -330,11 +333,23 @@ pub struct IndexInfo {
 /// order. Same name and layout as `pyroe make-splici`'s `t2g_3col.tsv`.
 pub const T2G_3COL_FILE: &str = "t2g_3col.tsv";
 
+/// File (in the index directory) listing every unspliced target with its
+/// genomic interval: `target<TAB>seqname<TAB>start<TAB>end<TAB>strand`,
+/// 0-based half-open, no header.
+pub const UNSPLICED_TARGETS_FILE: &str = "unspliced_targets.tsv";
+
+fn default_layout() -> String {
+    "sequence".to_string()
+}
+
 /// How the unspliced targets of an index were made (`info.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnsplicedInfo {
     /// `intron` or `premrna`
     pub mode: String,
+    /// `projection` or `sequence` (see [`UnsplicedLayout`])
+    #[serde(default = "default_layout")]
+    pub layout: String,
     /// flank added to each side of the merged introns (`intron` mode)
     pub flank: Option<u64>,
     pub genome: String,
@@ -522,7 +537,7 @@ fn preprocess_fasta(
     gencode: bool,
     clip_polya: bool,
     k: usize,
-    generated: Option<(&Path, &ahash::AHashSet<Vec<u8>>)>,
+    generated: Option<&Generated<'_>>,
 ) -> Result<PreprocessResult> {
     let out = std::io::BufWriter::new(
         std::fs::File::create(out_path)
@@ -536,6 +551,8 @@ fn preprocess_fasta(
         x: 0x9E37_79B9_7F4A_7C15,
         saw_decoy: false,
         seen: ahash::AHashMap::new(),
+        projection_refseq: None,
+        decoy_digests: ahash::AHashMap::new(),
         res: PreprocessResult {
             replaced: 0,
             duplicate_clusters: Vec::new(),
@@ -546,8 +563,9 @@ fn preprocess_fasta(
     };
     // The generated records are emitted exactly once: just before the first
     // decoy, or after the last input record when there is no decoy.
-    let mut pending = generated.map(|(path, _)| path);
-    let reserved = generated.map(|(_, names)| names);
+    let mut pending = generated;
+    let reserved = generated.map(|g| g.names);
+    let needed = generated.and_then(|g| g.check_decoys);
     for path in inputs {
         let mut reader = needletail::parse_fastx_file(path)
             .with_context(|| format!("opening {}", path.display()))?;
@@ -570,15 +588,61 @@ fn preprocess_fasta(
                     p.generated(g)?;
                 }
             }
-            p.record(name, &rec.seq(), is_decoy)?;
+            let seq = rec.seq();
+            if is_decoy {
+                if let Some(want) = needed.and_then(|n| n.get(&*String::from_utf8_lossy(name))) {
+                    p.decoy_digests
+                        .insert(name.to_vec(), unspliced::sequence_digest(&seq) == *want);
+                }
+            }
+            p.record(name, &seq, is_decoy)?;
         }
     }
     if let Some(g) = pending.take() {
         p.generated(g)?;
     }
     std::io::Write::flush(&mut p.out)?;
+    if let Some(w) = p.projection_refseq.as_mut() {
+        std::io::Write::flush(w)?;
+    }
+    // Projection copies alignments to a decoy onto targets using coordinates
+    // from the genome FASTA: both must be the very same sequence.
+    if let Some(want) = needed {
+        for seqname in want.keys() {
+            match p.decoy_digests.get(seqname.as_bytes()) {
+                Some(true) => {}
+                Some(false) => anyhow::bail!(
+                    "decoy {seqname:?} differs from the --genome sequence of the same name; \
+                     unspliced targets can only be projected onto the genome they were cut \
+                     from (use the same genome FASTA, or --unsplicedLayout sequence)"
+                ),
+                None => anyhow::bail!(
+                    "unspliced targets lie on {seqname:?}, which is not among the indexed decoys; \
+                     projection needs the genome as decoys (or --unsplicedLayout sequence)"
+                ),
+            }
+        }
+    }
     Ok(p.res)
 }
+
+/// Derived (unspliced) targets handed to [`preprocess_fasta`].
+struct Generated<'a> {
+    /// FASTA of the target sequences
+    path: &'a Path,
+    /// target names, reserved against input names
+    names: &'a ahash::AHashSet<Vec<u8>>,
+    /// projection layout: write here the targets' (cleaned) sequences for the
+    /// reference store, and only a k-mer-free placeholder to the index input
+    projection_refseq: Option<&'a Path>,
+    /// projection layout: expected digest of every decoy the targets lie on
+    check_decoys: Option<&'a std::collections::HashMap<String, u64>>,
+}
+
+/// Sequence written for a projected target in the index input: shorter than
+/// any k, so it carries no k-mer and the builder keeps it as a (relocated)
+/// short reference. Its real sequence goes to the reference store.
+const PROJECTION_PLACEHOLDER: &[u8] = b"A";
 
 /// The per-record state of [`preprocess_fasta`].
 struct Preprocessor {
@@ -601,18 +665,55 @@ struct Preprocessor {
     /// XXH64 over the unmodified sequence). Populated in both modes so duplicates
     /// are detected for `duplicate_clusters.tsv` even under --keepDuplicates.
     seen: ahash::AHashMap<Vec<u8>, Vec<u8>>,
+    /// projection layout: the targets' cleaned sequences, for the reference
+    /// store
+    projection_refseq: Option<std::io::BufWriter<std::fs::File>>,
+    /// projection layout: decoy name -> whether its digest matched the genome
+    decoy_digests: ahash::AHashMap<Vec<u8>, bool>,
     res: PreprocessResult,
 }
 
 impl Preprocessor {
-    /// Clean and write every record of a generated (non-decoy) FASTA.
-    fn generated(&mut self, path: &Path) -> Result<()> {
-        let mut reader = needletail::parse_fastx_file(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+    /// Clean and write every record of a generated (non-decoy) FASTA. In the
+    /// projection layout only a placeholder reaches the index input and the
+    /// sequence (non-ACGT bases replaced, nothing clipped, so it keeps the
+    /// length of its genomic interval) goes to the reference-store FASTA.
+    fn generated(&mut self, g: &Generated) -> Result<()> {
+        use std::io::Write as _;
+        if let Some(path) = g.projection_refseq {
+            self.projection_refseq = Some(std::io::BufWriter::new(
+                std::fs::File::create(path)
+                    .with_context(|| format!("creating {}", path.display()))?,
+            ));
+        }
+        let mut reader = needletail::parse_fastx_file(g.path)
+            .with_context(|| format!("opening {}", g.path.display()))?;
         while let Some(rec) = reader.next() {
             let rec = rec.context("reading generated FASTA record")?;
             let name = header_name(rec.id()).to_vec();
-            self.record(&name, &rec.seq(), false)?;
+            match self.projection_refseq.as_mut() {
+                None => self.record(&name, &rec.seq(), false)?,
+                Some(w) => {
+                    let mut seq = rec.seq().into_owned();
+                    for b in seq.iter_mut() {
+                        if !matches!(*b, b'A' | b'C' | b'G' | b'T') {
+                            self.x = self
+                                .x
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            *b = b"ACGT"[((self.x >> 33) & 3) as usize];
+                            self.res.replaced += 1;
+                        }
+                    }
+                    for (out, s) in [(&mut self.out, PROJECTION_PLACEHOLDER), (w, &seq[..])] {
+                        out.write_all(b">")?;
+                        out.write_all(&name)?;
+                        out.write_all(b"\n")?;
+                        out.write_all(s)?;
+                        out.write_all(b"\n")?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -850,7 +951,7 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
 
     // Unspliced targets (`--unspliced`): cut from the genome now, cleaned and
     // indexed with the transcripts below.
-    let unspliced = prepare_unspliced(opts, &intermediate_dir)?;
+    let unspliced = prepare_unspliced(opts, &intermediate_dir, &decoy_names)?;
 
     // Preprocess the references into the cleaned FASTA that feeds both the cDBG
     // build and the refseq store (the hashes below use the original input):
@@ -866,7 +967,15 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
         opts.gencode,
         opts.clip_polya,
         opts.k,
-        unspliced.as_ref().map(|u| (u.fasta.as_path(), &u.names)),
+        unspliced
+            .as_ref()
+            .map(|u| Generated {
+                path: &u.fasta,
+                names: &u.names,
+                projection_refseq: u.projection_refseq.as_deref(),
+                check_decoys: u.projection_refseq.as_ref().map(|_| &u.seq_digests),
+            })
+            .as_ref(),
     )
     .context("preprocessing reference FASTA (non-ACGT replacement, dedup)")?;
     // Everything below reports what the preprocessing did. Silent transformation
@@ -1099,7 +1208,13 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
 
     // Persist the (cleaned) reference sequences (piscem does not retain them) so
     // the selective-alignment step fetches windows matching the indexed k-mers.
-    write_refseq_store(&opts.output_dir, std::slice::from_ref(&cleaned), &idx)
+    // Projection layout: the targets' real sequences replace their index
+    // placeholders in the store (a later FASTA overrides a name).
+    let mut stored = vec![cleaned.clone()];
+    if let Some(p) = unspliced.as_ref().and_then(|u| u.projection_refseq.clone()) {
+        stored.push(p);
+    }
+    write_refseq_store(&opts.output_dir, &stored, &idx)
         .context("writing reference sequence store")?;
 
     if !opts.keep_intermediate {
@@ -1111,6 +1226,9 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
         }
         if let Some(u) = &unspliced {
             let _ = std::fs::remove_file(&u.fasta);
+            if let Some(p) = &u.projection_refseq {
+                let _ = std::fs::remove_file(p);
+            }
         }
         // sshash removes its own scratch files but leaves the directory. Prune
         // it: `remove_dir` only succeeds on an empty directory, so a caller-
@@ -1125,6 +1243,15 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
 /// The unspliced targets of a build, ready to be indexed.
 struct PreparedUnspliced {
     mode: UnsplicedMode,
+    /// resolved layout (never `Auto`)
+    layout: UnsplicedLayout,
+    /// projection layout: FASTA of the targets' sequences for the reference
+    /// store (a build intermediate)
+    projection_refseq: Option<PathBuf>,
+    /// written targets with their genomic intervals
+    targets: Vec<unspliced::WrittenTarget>,
+    /// digests of the genome sequences carrying targets
+    seq_digests: std::collections::HashMap<String, u64>,
     flank: Option<u64>,
     genome: PathBuf,
     gtf: PathBuf,
@@ -1139,7 +1266,11 @@ struct PreparedUnspliced {
 
 /// Validate the `--unspliced` options and, when on, derive the targets from
 /// the GTF and cut them from the genome into a FASTA under `dir`.
-fn prepare_unspliced(opts: &IndexBuildOptions, dir: &Path) -> Result<Option<PreparedUnspliced>> {
+fn prepare_unspliced(
+    opts: &IndexBuildOptions,
+    dir: &Path,
+    decoy_names: &ahash::AHashSet<Vec<u8>>,
+) -> Result<Option<PreparedUnspliced>> {
     if opts.unspliced == UnsplicedMode::None {
         anyhow::ensure!(
             opts.genome.is_none() && opts.gtf.is_none() && opts.flank.is_none(),
@@ -1209,10 +1340,36 @@ fn prepare_unspliced(opts: &IndexBuildOptions, dir: &Path) -> Result<Option<Prep
             st.dropped_low_acgt.join(", ")
         );
     }
+    // Projection needs every target to lie on an indexed decoy.
+    let on_decoys = !decoy_names.is_empty()
+        && st
+            .targets
+            .iter()
+            .all(|t| decoy_names.contains(t.seqname.as_bytes()));
+    let layout = match opts.unspliced_layout {
+        // Projection is opt-in until quant can project (next step).
+        UnsplicedLayout::Auto => UnsplicedLayout::Sequence,
+        UnsplicedLayout::Projection => {
+            anyhow::ensure!(
+                on_decoys,
+                "--unsplicedLayout projection needs the genome as decoys (-d): every \
+                 unspliced target must lie on a decoy sequence"
+            );
+            UnsplicedLayout::Projection
+        }
+        UnsplicedLayout::Sequence => UnsplicedLayout::Sequence,
+    };
+    info!("unspliced layout: {}", layout.as_str());
+    let projection_refseq =
+        (layout == UnsplicedLayout::Projection).then(|| dir.join("unspliced_refseq.fa"));
     let names = targets.iter().map(|t| t.name.as_bytes().to_vec()).collect();
     let target_gene = targets.into_iter().map(|t| (t.name, t.gene_id)).collect();
     Ok(Some(PreparedUnspliced {
         mode: opts.unspliced,
+        layout,
+        projection_refseq,
+        targets: st.targets,
+        seq_digests: st.seq_digests,
         flank,
         genome,
         gtf,
@@ -1233,6 +1390,24 @@ fn write_t2g_3col(
     u: &PreparedUnspliced,
 ) -> Result<UnsplicedInfo> {
     use std::io::Write as _;
+    // Genomic interval of every target (both layouts; projection reads it at
+    // quant time).
+    let tpath = dir.join(UNSPLICED_TARGETS_FILE);
+    let mut tw = std::io::BufWriter::new(
+        std::fs::File::create(&tpath).with_context(|| format!("creating {}", tpath.display()))?,
+    );
+    for t in &u.targets {
+        writeln!(
+            tw,
+            "{}\t{}\t{}\t{}\t{}",
+            t.name,
+            t.seqname,
+            t.start,
+            t.end,
+            if t.minus { '-' } else { '+' }
+        )?;
+    }
+    tw.flush()?;
     let path = dir.join(T2G_3COL_FILE);
     let mut w = std::io::BufWriter::new(
         std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?,
@@ -1265,6 +1440,7 @@ fn write_t2g_3col(
     }
     Ok(UnsplicedInfo {
         mode: u.mode.as_str().to_string(),
+        layout: u.layout.as_str().to_string(),
         flank: u.flank,
         genome: u.genome.display().to_string(),
         gtf: u.gtf.display().to_string(),
@@ -1393,6 +1569,62 @@ pub struct SalmonIndex {
     ref_offsets: Vec<u64>,
     /// whether the reference sequence bytes were loaded
     refseq_loaded: bool,
+    /// projection layout: every reference's true length (the targets are
+    /// k-mer-free placeholders in the piscem index); `None` otherwise
+    ref_lens: Option<Vec<u64>>,
+    /// projection layout: the unspliced targets and their decoy intervals
+    projection: Option<Vec<ProjectedTarget>>,
+}
+
+/// An unspliced target of a projection-layout index: reference `tid` is the
+/// interval `[start, end)` of decoy reference `decoy` (read reverse-complemented
+/// when `minus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectedTarget {
+    pub decoy: u32,
+    pub tid: u32,
+    pub start: u32,
+    pub end: u32,
+    pub minus: bool,
+}
+
+/// Read [`UNSPLICED_TARGETS_FILE`] and resolve every target and decoy name to
+/// its reference id; returns the targets and every reference's true length.
+fn load_projection(dir: &Path, inner: &ReferenceIndex) -> Result<(Vec<ProjectedTarget>, Vec<u64>)> {
+    let path = dir.join(UNSPLICED_TARGETS_FILE);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let n = inner.num_refs();
+    let tid_of: ahash::AHashMap<&str, u32> =
+        (0..n).map(|t| (inner.ref_name(t), t as u32)).collect();
+    let mut lens: Vec<u64> = (0..n).map(|t| inner.ref_len(t)).collect();
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let bad = || anyhow::anyhow!("{}:{}: malformed line {line:?}", path.display(), i + 1);
+        if f.len() != 5 {
+            return Err(bad());
+        }
+        let (start, end): (u32, u32) = (
+            f[2].parse().map_err(|_| bad())?,
+            f[3].parse().map_err(|_| bad())?,
+        );
+        let tid = *tid_of
+            .get(f[0])
+            .with_context(|| format!("unspliced target {:?} is not in the index", f[0]))?;
+        let decoy = *tid_of.get(f[1]).with_context(|| {
+            format!("decoy {:?} of target {:?} is not in the index", f[1], f[0])
+        })?;
+        lens[tid as usize] = u64::from(end - start);
+        out.push(ProjectedTarget {
+            decoy,
+            tid,
+            start,
+            end,
+            minus: f[4] == "-",
+        });
+    }
+    Ok((out, lens))
 }
 
 /// The splicing annotation (`t2g_3col.tsv`) of an index built with
@@ -1528,12 +1760,22 @@ impl SalmonIndex {
         } else {
             (Vec::new(), Vec::new())
         };
+        let (projection, ref_lens) = match &info.unspliced {
+            Some(u) if u.layout == "projection" => {
+                let (p, l) = load_projection(dir, &inner)
+                    .context("loading the unspliced targets of a projection-layout index")?;
+                (Some(p), Some(l))
+            }
+            _ => (None, None),
+        };
         Ok(Self {
             inner,
             info,
             refseq,
             ref_offsets,
             refseq_loaded: load_refseq,
+            ref_lens,
+            projection,
         })
     }
 
@@ -1594,7 +1836,16 @@ impl SalmonIndex {
 
     /// length of reference `i`.
     pub fn ref_len(&self, i: usize) -> u64 {
-        self.inner.ref_len(i)
+        match &self.ref_lens {
+            Some(l) => l[i],
+            None => self.inner.ref_len(i),
+        }
+    }
+
+    /// The unspliced targets reached by projection (an index built with
+    /// `--unspliced` in the projection layout); `None` for any other index.
+    pub fn projection_targets(&self) -> Option<&[ProjectedTarget]> {
+        self.projection.as_deref()
     }
 
     /// whether an equivalence-class table is available (pseudoalignment mode).
@@ -1816,6 +2067,7 @@ mod tests {
         let out = tmp.path().join("splici");
         let mut opts = plain.clone();
         opts.output_dir = out.clone();
+        opts.unspliced_layout = UnsplicedLayout::Sequence;
         opts.unspliced = UnsplicedMode::Intron;
         opts.genome = Some(genome);
         opts.gtf = Some(gtf);
@@ -1863,6 +2115,107 @@ mod tests {
         assert_ne!(info.seq_hash, plain_info.seq_hash);
         assert_ne!(info.name_hash, plain_info.name_hash);
         assert_eq!(info.decoy_seq_hash, plain_info.decoy_seq_hash);
+    }
+
+    /// Projection layout: the targets carry no k-mers and sit after the decoys
+    /// as short references, the store keeps their real sequence, their true
+    /// length is restored on load, and their decoy intervals are exposed.
+    #[test]
+    fn projection_layout_keeps_targets_out_of_the_kmer_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gentrome, decoys, genome, gtf, chr1, chr2) = unspliced_fixture(tmp.path());
+        let out = tmp.path().join("proj");
+        let mut opts = IndexBuildOptions::new(vec![gentrome], out.clone());
+        opts.threads = 1;
+        opts.decoys = Some(decoys);
+        opts.unspliced = UnsplicedMode::Intron;
+        opts.unspliced_layout = UnsplicedLayout::Projection;
+        opts.genome = Some(genome);
+        opts.gtf = Some(gtf);
+        opts.flank = Some(30);
+        let info = build(&opts).expect("projection build");
+        let u = info.unspliced.clone().unwrap();
+        assert_eq!(u.layout, "projection");
+        // transcripts, then the two chromosomes, then the three targets
+        assert_eq!(
+            (info.first_decoy_index, info.num_decoys, info.num_refs),
+            (Some(3), 2, 8)
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join(T2G_3COL_FILE)).unwrap(),
+            "T1\tG1\tS\nT1ri\tG1\tS\nT2\tG2\tS\nG1-I\tG1\tU\nG1-I1\tG1\tU\nG2-I\tG2\tU\n"
+        );
+        assert!(!out.join("unspliced_refseq.fa").exists());
+
+        let idx = SalmonIndex::load(&out).unwrap();
+        let tid = |n: &str| (0..idx.num_refs()).find(|&i| idx.ref_name(i) == n).unwrap();
+        let (g1, g2) = (tid("G1-I"), tid("G2-I"));
+        assert!(g1 > 4 && g2 > 4, "targets follow the decoy block");
+        assert_eq!(idx.ref_len(g1), 360);
+        assert_eq!(idx.ref_seq(g1 as u32), &chr1.as_bytes()[1170..1530]);
+        assert_eq!(idx.ref_seq(g2 as u32), revcomp(&chr2[670..1230]).as_bytes());
+        let p = idx.projection_targets().expect("projection targets");
+        let (c1, c2) = (tid("chr1") as u32, tid("chr2") as u32);
+        assert_eq!(
+            p,
+            [
+                ProjectedTarget {
+                    decoy: c1,
+                    tid: g1 as u32,
+                    start: 1170,
+                    end: 1530,
+                    minus: false
+                },
+                ProjectedTarget {
+                    decoy: c1,
+                    tid: tid("G1-I1") as u32,
+                    start: 1670,
+                    end: 2230,
+                    minus: false
+                },
+                ProjectedTarget {
+                    decoy: c2,
+                    tid: g2 as u32,
+                    start: 670,
+                    end: 1230,
+                    minus: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_layout_requires_the_same_genome_as_decoys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gentrome, decoys, genome, gtf, chr1, chr2) = unspliced_fixture(tmp.path());
+        let mut opts = IndexBuildOptions::new(vec![gentrome.clone()], tmp.path().join("i"));
+        opts.threads = 1;
+        opts.unspliced = UnsplicedMode::Premrna;
+        opts.unspliced_layout = UnsplicedLayout::Projection;
+        opts.gtf = Some(gtf);
+
+        // a genome whose chr1 differs from the decoy chr1
+        let other = tmp.path().join("other.fa");
+        let mut c1 = chr1.clone().into_bytes();
+        c1[10] = if c1[10] == b'A' { b'C' } else { b'A' };
+        std::fs::write(
+            &other,
+            format!(">chr1\n{}\n>chr2\n{chr2}\n", String::from_utf8(c1).unwrap()),
+        )
+        .unwrap();
+        let mut o = opts.clone();
+        o.decoys = Some(decoys);
+        o.genome = Some(other);
+        let e = format!("{:#}", build(&o).unwrap_err());
+        assert!(e.contains("differs from the --genome sequence"), "{e}");
+
+        // no decoys at all
+        let mut o = opts.clone();
+        o.genome = Some(genome);
+        o.transcripts = vec![tmp.path().join("t.fa")];
+        std::fs::write(&o.transcripts[0], format!(">T\n{}\n", lcg_seq(300, 9))).unwrap();
+        let e = format!("{:#}", build(&o).unwrap_err());
+        assert!(e.contains("needs the genome as decoys"), "{e}");
     }
 
     #[test]

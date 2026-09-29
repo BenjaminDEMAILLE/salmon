@@ -285,6 +285,46 @@ impl std::str::FromStr for UnsplicedMode {
     }
 }
 
+/// How unspliced targets are held in the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnsplicedLayout {
+    /// `projection` when every target lies on a sequence given as a decoy
+    /// (the genome is in the gentrome), `sequence` otherwise.
+    #[default]
+    Auto,
+    /// Targets carry no k-mers; alignments to the genome decoy inside a
+    /// target's interval are projected onto it at quant time. The k-mer index
+    /// and mapping cost stay those of the gentrome.
+    Projection,
+    /// Target sequences are indexed like transcripts (works without decoys).
+    Sequence,
+}
+
+impl UnsplicedLayout {
+    /// Name used on the command line and in `info.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnsplicedLayout::Auto => "auto",
+            UnsplicedLayout::Projection => "projection",
+            UnsplicedLayout::Sequence => "sequence",
+        }
+    }
+}
+
+impl std::str::FromStr for UnsplicedLayout {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(UnsplicedLayout::Auto),
+            "projection" => Ok(UnsplicedLayout::Projection),
+            "sequence" => Ok(UnsplicedLayout::Sequence),
+            other => Err(format!(
+                "unknown unspliced layout {other:?} (expected auto, projection or sequence)"
+            )),
+        }
+    }
+}
+
 /// Suffix that marks an unspliced target, followed by an ordinal from the
 /// second interval of a gene on (`G-I`, `G-I1`, `G-I2`, ...). This is the
 /// naming `pyroe make-splici` / `make-spliceu` use, so `t2g_3col.tsv` and
@@ -373,6 +413,40 @@ pub struct ExtractStats {
     pub dropped_missing_seq: usize,
     /// annotation sequence names absent from the genome FASTA
     pub missing_seqnames: Vec<String>,
+    /// every written target with its final (clipped) genomic interval, in
+    /// output order
+    pub targets: Vec<WrittenTarget>,
+    /// digest of each genome sequence that carries targets (see
+    /// [`sequence_digest`]), to check that the decoys are the same sequences
+    pub seq_digests: HashMap<String, u64>,
+}
+
+/// A target as written: its genomic interval after clipping at the sequence
+/// end, 0-based half-open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenTarget {
+    pub name: String,
+    pub seqname: String,
+    pub start: u64,
+    pub end: u64,
+    pub minus: bool,
+}
+
+/// Case-insensitive digest of a sequence (xxh3 over its uppercased bytes),
+/// used to check that a genome FASTA and the index's decoys hold the same
+/// sequences before alignments to the latter are projected with coordinates
+/// from the former.
+pub fn sequence_digest(seq: &[u8]) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = [0u8; 8192];
+    for chunk in seq.chunks(buf.len()) {
+        let b = &mut buf[..chunk.len()];
+        for (o, &c) in b.iter_mut().zip(chunk) {
+            *o = c.to_ascii_uppercase();
+        }
+        h.update(b);
+    }
+    h.digest()
 }
 
 /// Complement of an (uppercase) base; anything but ACGT becomes `N`.
@@ -434,6 +508,9 @@ pub fn write_unspliced_fasta(
         };
         let seq = rec.seq();
         let len = seq.len() as u64;
+        stats
+            .seq_digests
+            .insert(seqname.clone(), sequence_digest(&seq));
         for t in ts {
             if t.start >= len {
                 stats.dropped_missing_seq += 1;
@@ -468,6 +545,13 @@ pub fn write_unspliced_fasta(
             w.write_all(&buf)?;
             w.write_all(b"\n")?;
             stats.written += 1;
+            stats.targets.push(WrittenTarget {
+                name: t.name.clone(),
+                seqname: seqname.clone(),
+                start: t.start,
+                end: stop,
+                minus: t.strand == Strand::Minus,
+            });
         }
     }
     w.flush()?;
