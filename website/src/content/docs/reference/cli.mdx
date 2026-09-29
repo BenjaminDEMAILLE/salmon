@@ -47,6 +47,7 @@ Build a reusable index from one or more transcriptome FASTA files.
 | `--gtf <GTF>` | Annotation (plain or gzipped GTF) for `--unspliced`; also the gene column of `t2g_3col.tsv`. |
 | `--flank <N>` | Bases added to each side of the merged introns (`--unspliced intron`). Recommended: read length − 1, so any read with one intronic base fits inside an intron target. |
 | `--readLength <L>` | Shorthand for `--flank L-1`. |
+| `--unsplicedLayout <L>` | `projection`: targets carry no k-mers; genome-decoy alignments inside a target are projected onto it (needs the same genome as decoys, `-d`; selective alignment only). `sequence`: target sequences are indexed like transcripts. `auto` (default): projection whenever every target lies on a decoy. |
 
 ```sh
 salmon index -t transcripts.fa -i salmon_index -p 16

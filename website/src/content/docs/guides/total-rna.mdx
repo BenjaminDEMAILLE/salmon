@@ -51,6 +51,27 @@ They sit between the transcripts and the decoys in the index, and the index
 also records `t2g_3col.tsv`: `target<TAB>gene<TAB>S|U` for every quantified
 target, the same file `pyroe` writes.
 
+### How the targets are held: `--unsplicedLayout`
+
+A target is a slice of the genome, so when the genome is also in the index as
+decoys there is no need to index its sequence twice. In the **projection**
+layout (the default whenever every target lies on a decoy) the targets carry
+no k-mers: reads are mapped to the transcripts and the genome as with a plain
+gentrome, and an alignment to the genome that lies wholly inside a target's
+interval is copied onto that target, with the same score and with coordinates
+shifted or reflected (minus-strand genes) to the target's frame. The index and
+the mapping cost stay close to those of the gentrome.
+
+The **sequence** layout indexes the targets' sequences like transcripts. It is
+what `auto` picks without genome decoys, and it can be requested explicitly.
+Both layouts give the same alignments: on the simulation in salmon's test
+suite, 0.0001% of the fragment mass differs between them. Two differences
+remain. The projection layout needs selective alignment (`--sketch` is
+refused), and for single-end reads the mapper keeps one genomic locus per
+chromosome and strand, so a repeat present in several introns of one
+chromosome is projected onto fewer targets than the sequence layout would
+reach.
+
 ### Which mode
 
 `intron` keeps the unspliced targets off constitutive exons (apart from the
@@ -111,11 +132,14 @@ decoy.
 
 ## Costs and limits
 
-- **Index size and build time** grow with the unspliced sequence: roughly the
-  total intron length (`intron`) or gene-body length (`premrna`) of the
-  annotation, about half of the human genome for the latter. With the genome
-  already present as decoys the set of k-mers barely changes; the reference
-  store and the position tables grow.
+- **Index size, build time and mapping cost** stay close to the gentrome's in
+  the projection layout; only the reference store grows by the targets'
+  sequences (used for effective lengths and bias correction). The sequence
+  layout also grows the position tables and makes every intronic k-mer occur
+  twice, which slows mapping.
+- **Bias correction** (`--gcBias`, `--seqBias`) evaluates unspliced targets at
+  every 16th fragment start, weighted by 16, rather than at every start: their
+  length would otherwise dominate the run.
 - **Overlapping genes** each get their own unspliced target over the shared
   region; fragments there are shared by the EM like any multi-mapping fragment.
   Antisense overlaps are separated by strand on stranded libraries only.

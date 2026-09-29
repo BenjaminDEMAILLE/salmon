@@ -353,8 +353,11 @@ this log.
 
 An index built with `--unspliced` also holds `t2g_3col.tsv`
 (`target<TAB>gene<TAB>S|U`, no header, one row per quantified target in index
-order, as written by `pyroe make-splici`) and an `unspliced` block in
-`info.json` (`mode`, `flank`, `genome`, `gtf`, `t2g_file` and target counts).
+order, as written by `pyroe make-splici`), `unspliced_targets.tsv`
+(`target<TAB>seqname<TAB>start<TAB>end<TAB>strand`, 0-based half-open genomic
+intervals) and an `unspliced` block in `info.json` (`mode`, `layout`, `flank`,
+`genome`, `gtf`, `t2g_file` and target counts). In the projection layout the
+targets are k-mer-free references placed after the decoy block.
 
 The 2.0 index is the piscem-rs format and is **not** compatible with C++ salmon
 (pufferfish) indices — they must be rebuilt. Pointing 2.0 at a C++ index (or C++
