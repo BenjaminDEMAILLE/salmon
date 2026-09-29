@@ -838,6 +838,15 @@ struct QuantArgs {
     /// genome; only affects fragments that retain a transcript candidate.
     #[arg(long = "allowDecoyOrphans")]
     allow_decoy_orphans: bool,
+    /// Treat a decoy alignment that ties the best transcript alignment as
+    /// dominating it (drop the fragment): `bestTxpScore <= decoyThreshold *
+    /// bestDecoyScore` instead of salmon's strict `<`. Off by default. With a
+    /// genome decoy, this sends intronic fragments that are also contained in
+    /// a retained-intron isoform to the decoy rather than to that isoform; an
+    /// index built with `--unspliced` is the more complete answer, as it gives
+    /// such fragments a target of their own (selective alignment only).
+    #[arg(long = "decoyWinsTies")]
+    decoy_wins_ties: bool,
     /// Allow soft-clipping of read ends during selective alignment: unaligned
     /// read-end bases are clipped rather than penalized. (salmon's --softclip)
     #[arg(long = "softclip")]
@@ -2103,6 +2112,7 @@ fn reads_only_mapping_flags(args: &QuantArgs) -> Vec<(&'static str, bool)> {
             args.orphan_chain_sub_thresh.is_some(),
         ),
         ("--decoyThreshold", args.decoy_threshold.is_some()),
+        ("--decoyWinsTies", args.decoy_wins_ties),
         // NB --hardFilter and --discardOrphans are deliberately absent: both
         // are honoured on these paths (see the -a/--rad option blocks).
         ("--allowDecoyOrphans", args.allow_decoy_orphans),
@@ -2813,6 +2823,12 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
             args.decoy_threshold.unwrap_or(1.0)
         );
     }
+    if args.sketch && args.decoy_wins_ties {
+        tracing::warn!(
+            "--decoyWinsTies has no effect in --sketch mode: sketch compares no alignment \
+             scores, so there is no transcript/decoy tie to break."
+        );
+    }
     // The one-pass reads path writes no intermediate RAD, so the flags that
     // place or shape one are inert — `-a --online` and `--rad` already say so.
     if args.online {
@@ -2961,6 +2977,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
     opts.map_config.score.min_aln_prob = args.min_aln_prob.unwrap_or(1e-5);
     opts.map_config.score.hard_filter = args.hard_filter;
     opts.map_config.score.allow_decoy_orphans = args.allow_decoy_orphans;
+    opts.map_config.score.decoy_wins_ties = args.decoy_wins_ties;
     // chaining sub-optimality thresholds (Tier 2)
     opts.map_config.collect.chain.chain_subopt_thresh =
         args.pre_merge_chain_sub_thresh.unwrap_or(0.8);
