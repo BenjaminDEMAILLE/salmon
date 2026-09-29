@@ -95,14 +95,16 @@ Map targets to genes with the index's `t2g_3col.tsv`. Two common choices:
   length correction. `quant.genes.usa.tsv` gives the same totals split by
   status.
 
-## Related option: `--decoyWinsTies`
+## Why not send ties to the decoy instead
 
-`salmon quant --decoyWinsTies` makes a decoy that *ties* the best transcript
-dominate it (`<=` instead of `<`). On a plain gentrome index this discards the
-intronic fragments that would have gone to retained-intron isoforms instead of
-keeping them. It is off by default and independent of `--unspliced`; the
-unspliced index is the more complete fix, since it counts those fragments
-instead of dropping them.
+Making a decoy that *ties* the best transcript win would not help: the genome
+contains every exon, so any fragment lying within one exon scores the same on
+its transcript and on the genome, and all of them would be discarded. With an
+unspliced index the strict rule does the right thing: an intronic fragment ties
+between its gene's unspliced target and the genome, the tie goes to the target,
+and the fragment is counted as unspliced. Only fragments that align strictly
+better to the genome (intergenic, unannotated, or from another locus) go to the
+decoy.
 
 ## Costs and limits
 

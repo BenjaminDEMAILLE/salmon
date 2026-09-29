@@ -117,25 +117,6 @@ pub struct ScoreConfig {
     /// cannot recover fragments whose transcript placements were never generated
     /// (e.g. high-occurrence multimappers that only seed the genome).
     pub allow_decoy_orphans: bool,
-    /// Also drop the read when the best decoy score *ties* the best transcript
-    /// score times `decoy_thresh` (`--decoyWinsTies`): the domination test
-    /// becomes `best_valid <= decoy_thresh * best_decoy`. Off by default,
-    /// keeping salmon's strict inequality. With genome decoys a tie usually
-    /// means an intronic fragment that is also contained in a retained-intron
-    /// isoform; this sends it to the decoy instead of that isoform.
-    pub decoy_wins_ties: bool,
-}
-
-impl ScoreConfig {
-    /// Whether a fragment whose best transcript score is `best_valid` is
-    /// dominated by a decoy scoring `best_decoy` (see `decoy_thresh` and
-    /// `decoy_wins_ties`).
-    #[inline]
-    fn decoy_dominates(&self, best_valid: i32, best_decoy: i32) -> bool {
-        let bar = self.decoy_thresh * (best_decoy as f64);
-        let v = best_valid as f64;
-        v < bar || (self.decoy_wins_ties && v <= bar)
-    }
 }
 
 impl Default for ScoreConfig {
@@ -146,7 +127,6 @@ impl Default for ScoreConfig {
             decoy_thresh: 1.0,
             hard_filter: false,
             allow_decoy_orphans: false,
-            decoy_wins_ties: false,
         }
     }
 }
@@ -334,7 +314,7 @@ pub fn finalize_mappings_counted_into(
     // drop the read when its best transcript score falls below the decoy bar —
     // unless `--allowDecoyOrphans` asks us to keep the transcript placement(s).
     if let Some(bd) = best_decoy {
-        if cfg.decoy_dominates(best_valid, bd) && !cfg.allow_decoy_orphans {
+        if (best_valid as f64) < cfg.decoy_thresh * (bd as f64) && !cfg.allow_decoy_orphans {
             best_per_tid.clear();
             return (true, 0);
         }
@@ -427,7 +407,8 @@ pub fn filter_sketch_decoys<R: RefProvider>(
             // falls below the decoy bar, unless `--allowDecoyOrphans` keeps the
             // transcript hits.
             if let Some(bd) = best_decoy {
-                if cfg.decoy_dominates(best_valid, bd) && !cfg.allow_decoy_orphans {
+                if (best_valid as f64) < cfg.decoy_thresh * (bd as f64) && !cfg.allow_decoy_orphans
+                {
                     maps.clear();
                     return true;
                 }
@@ -577,22 +558,6 @@ mod tests {
             &ScoreConfig::default(),
         );
         assert!(m.is_empty());
-    }
-
-    #[test]
-    /// A decoy that only ties the best transcript does not dominate by default
-    /// (salmon's strict rule); `--decoyWinsTies` makes the tie go to the decoy,
-    /// and a strictly better transcript still wins.
-    fn decoy_tie_goes_to_the_transcript_unless_asked() {
-        let tie = || vec![raw(0, 95, false), raw(1, 95, true)];
-        assert_eq!(finalize_mappings(tie(), &ScoreConfig::default()).len(), 1);
-        let cfg = ScoreConfig {
-            decoy_wins_ties: true,
-            ..ScoreConfig::default()
-        };
-        assert!(finalize_mappings(tie(), &cfg).is_empty());
-        let better = vec![raw(0, 96, false), raw(1, 95, true)];
-        assert_eq!(finalize_mappings(better, &cfg).len(), 1);
     }
 
     #[test]
