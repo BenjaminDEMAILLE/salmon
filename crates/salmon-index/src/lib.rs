@@ -133,6 +133,13 @@ pub struct IndexInfo {
     /// all decoy records to appear contiguously at the end of the FASTA.
     #[serde(default)]
     pub first_decoy_index: Option<usize>,
+    /// Number of decoy references, i.e. decoys occupy
+    /// `[first_decoy_index, first_decoy_index + num_decoys)`. References shorter
+    /// than `k` are moved to the end of the id space by the index builder, so a
+    /// short *transcript* can follow the decoy block. `None` (older indices)
+    /// means the decoys run to the end.
+    #[serde(default)]
+    pub num_decoys: Option<usize>,
     /// salmon version that produced the index
     pub salmon_version: String,
     /// SHA-256/512 of the reference sequences and names, computed to byte-match
@@ -272,6 +279,7 @@ fn preprocess_fasta(
     decoy_names: &ahash::AHashSet<Vec<u8>>,
     gencode: bool,
     clip_polya: bool,
+    k: usize,
 ) -> Result<PreprocessResult> {
     use std::io::Write as _;
     const B: [u8; 4] = *b"ACGT";
@@ -288,6 +296,7 @@ fn preprocess_fasta(
     let mut retained = 0usize;
     let mut first_decoy_index: Option<usize> = None;
     let mut saw_decoy = false;
+    let mut short_decoys_dropped = 0usize;
     // Exact original (pure-ACGT) sequence -> name of the first transcript that
     // carried it. salmon collapses transcripts whose *processed* sequences match;
     // because it randomizes non-ACGT bases with a position-advancing RNG, two
@@ -370,6 +379,13 @@ fn preprocess_fasta(
                 }
             }
 
+            // A decoy shorter than `k` has no k-mers, so it can never be hit; the
+            // index builder would also move it past any short transcripts,
+            // breaking decoy contiguity. Drop it.
+            if is_decoy && seq.len() < k {
+                short_decoys_dropped += 1;
+                continue;
+            }
             if is_decoy && first_decoy_index.is_none() {
                 first_decoy_index = Some(retained);
             }
@@ -383,6 +399,9 @@ fn preprocess_fasta(
         }
     }
     out.flush()?;
+    if short_decoys_dropped > 0 {
+        info!("dropped {short_decoys_dropped} decoy reference(s) shorter than k={k}");
+    }
     Ok(PreprocessResult {
         replaced,
         duplicate_clusters,
@@ -492,6 +511,7 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
         &decoy_names,
         opts.gencode,
         opts.clip_polya,
+        opts.k,
     )
     .context("preprocessing reference FASTA (non-ACGT replacement, dedup)")?;
     if pre.replaced > 0 {
@@ -560,19 +580,36 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
     // Reference seq/name hashes (salmon-FixFasta-compatible), over the input FASTA.
     let h = compute_ref_hashes(&opts.transcripts, &decoy_names, opts.gencode)
         .context("hashing reference sequences/names")?;
-    if let Some(fdi) = pre.first_decoy_index {
-        info!(
-            "{} decoy reference(s) (first decoy index {fdi})",
-            idx.num_refs() - fdi
-        );
-    }
+    // Locate the decoy block by name in the *index's* id order: the builder
+    // appends references shorter than `k` after everything else, so short
+    // transcripts can land after the decoys and the write-order index from
+    // preprocessing is not reliable.
+    let (first_decoy_index, num_decoys) = if pre.first_decoy_index.is_some() {
+        let is_decoy = |tid: usize| decoy_names.contains(idx.ref_name(tid).as_bytes());
+        let first = (0..idx.num_refs()).find(|&t| is_decoy(t));
+        match first {
+            Some(fdi) => {
+                let nd = (fdi..idx.num_refs()).take_while(|&t| is_decoy(t)).count();
+                anyhow::ensure!(
+                    (fdi + nd..idx.num_refs()).all(|t| !is_decoy(t)),
+                    "decoy references are not contiguous in the built index"
+                );
+                info!("{nd} decoy reference(s) (first decoy index {fdi})");
+                (Some(fdi), Some(nd))
+            }
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     let info = IndexInfo {
         k: opts.k,
         m,
         canonical: opts.canonical,
         has_ec_table: idx.has_ec_table(),
         num_refs: idx.num_refs(),
-        first_decoy_index: pre.first_decoy_index,
+        first_decoy_index,
+        num_decoys,
         salmon_version: env!("CARGO_PKG_VERSION").to_string(),
         seq_hash: h.seq_hash,
         name_hash: h.name_hash,
@@ -662,6 +699,13 @@ fn write_refseq_store(dir: &Path, transcripts: &[PathBuf], idx: &ReferenceIndex)
         let seq = by_name.get(name.as_bytes()).ok_or_else(|| {
             anyhow::anyhow!("reference '{name}' from the index was not found in the input FASTA")
         })?;
+        anyhow::ensure!(
+            seq.len() as u64 == idx.ref_len(tid),
+            "reference '{name}' has length {} in the FASTA but {} in the index \
+             (duplicate reference names?)",
+            seq.len(),
+            idx.ref_len(tid)
+        );
         concat.extend_from_slice(seq);
         offsets.push(concat.len() as u64);
     }
@@ -796,10 +840,28 @@ impl salmon_core::RefProvider for SalmonIndex {
         self.ref_seq(tid)
     }
     fn is_decoy(&self, tid: u32) -> bool {
-        // References at or beyond `first_decoy_index` are decoys.
-        self.info
-            .first_decoy_index
-            .is_some_and(|fdi| (tid as usize) >= fdi)
+        self.info.is_decoy(tid as usize)
+    }
+}
+
+impl IndexInfo {
+    /// Reference-id range occupied by decoys (empty when there are none).
+    pub fn decoy_range(&self) -> std::ops::Range<usize> {
+        match self.first_decoy_index {
+            Some(fdi) => {
+                let end = self
+                    .num_decoys
+                    .map_or(self.num_refs, |nd| (fdi + nd).min(self.num_refs));
+                fdi..end.max(fdi)
+            }
+            None => 0..0,
+        }
+    }
+
+    /// Whether reference `tid` is a decoy.
+    #[inline]
+    pub fn is_decoy(&self, tid: usize) -> bool {
+        self.decoy_range().contains(&tid)
     }
 }
 

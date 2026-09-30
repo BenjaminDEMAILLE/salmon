@@ -161,7 +161,7 @@ pub struct AlignQuantResult {
     pub start_time: String,
     pub bias_dump: salmon_model::dumps::BiasDump,
     /// per-transcript (unique, ambiguous) fragment counts for `ambig_info.tsv`
-    pub ambig: (Vec<u32>, Vec<u32>),
+    pub ambig: (Vec<u64>, Vec<u64>),
 }
 
 /// Current local time as an asctime-style string, matching salmon's timestamps.

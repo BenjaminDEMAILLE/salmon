@@ -543,7 +543,7 @@ where
         let mut model = GcFragModel::new(cond_bins, gc_bins);
         for frag_start in 0..(ref_len - k) {
             let mut prev = cond(sp);
-            let mut fl = fld_low as i32;
+            let mut fl = fld_low.max(1) as i32; // a zero-length fragment has no end base
             while fl <= fld_high as i32 {
                 let frag_end = frag_start as i32 + fl - 1;
                 if (frag_end as usize) < ref_len {
@@ -645,7 +645,7 @@ pub fn gc_corrected_effective_length(
     let ctx = GcContext::build(&GcView::Dense(prefix));
     let stride = stride.max(1) as i32;
     let max_len = (ref_len as i32).min(fld_high as i32 + 1);
-    let mut fl = fld_low as i32;
+    let mut fl = fld_low.max(1) as i32; // a zero-length fragment has no end base
     let mut done = fl >= max_len;
     let sp = if fl > 0 { fl - 1 } else { 0 };
     let mut prev_mass = cond(sp);

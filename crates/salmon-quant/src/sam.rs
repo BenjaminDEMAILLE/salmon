@@ -106,13 +106,15 @@ fn rc(seq: &[u8]) -> Vec<u8> {
 /// `<readLen>M`, becoming `<S>...<M>` where the read hangs off either end.
 /// Returns `(cigar, adjusted_pos)`.
 fn overhang_cigar(pos: i32, read_len: i32, txp_len: i32) -> (String, i32) {
-    if pos + read_len < 0 {
+    // `<=` / `>=`: a read with no overlapping base must be all soft-clip, never
+    // a zero-length `0M` op (rejected by htslib/samtools).
+    if pos + read_len <= 0 {
         (format!("{read_len}S"), 0)
     } else if pos < 0 {
         let match_len = read_len + pos;
         let clip = read_len - match_len;
         (format!("{clip}S{match_len}M"), 0)
-    } else if pos > txp_len {
+    } else if pos >= txp_len {
         (format!("{read_len}S"), pos)
     } else if pos + read_len > txp_len {
         let match_len = txp_len - pos;
@@ -242,5 +244,20 @@ pub fn write_fragment(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overhang_cigar;
+
+    #[test]
+    fn overhang_cigar_never_emits_zero_length_ops() {
+        assert_eq!(overhang_cigar(10, 50, 100), ("50M".to_string(), 10));
+        assert_eq!(overhang_cigar(-10, 50, 100), ("10S40M".to_string(), 0));
+        assert_eq!(overhang_cigar(80, 50, 100), ("20M30S".to_string(), 80));
+        // read ends exactly at the transcript start / starts exactly at its end
+        assert_eq!(overhang_cigar(-50, 50, 100), ("50S".to_string(), 0));
+        assert_eq!(overhang_cigar(100, 50, 100), ("50S".to_string(), 100));
     }
 }

@@ -215,16 +215,17 @@ fn collect_context(
         }
     };
 
-    if m.is_fw {
+    if m.fragment_len > 0 {
+        // Paired fragment: `ref_pos` is the fragment's leftmost base whichever
+        // mate is forward, so the forward mate's 5' is `ref_pos` and the
+        // reverse mate's 5' is the fragment's last base (e.g. ISR libraries,
+        // where mate 1 is the reverse one).
+        add_fwd(&mut obs.0, m.ref_pos);
+        add_rev(&mut obs.1, m.ref_pos + m.fragment_len - 1);
+    } else if m.is_fw {
         add_fwd(&mut obs.0, m.ref_pos); // 5' -> forward model
-        if m.fragment_len > 0 {
-            add_rev(&mut obs.1, m.ref_pos + m.fragment_len - 1); // 3' -> RC model
-        }
     } else {
         add_rev(&mut obs.1, m.ref_pos); // reverse read's 5' -> RC model
-        if m.fragment_len > 0 {
-            add_fwd(&mut obs.0, m.ref_pos - m.fragment_len + 1); // 3' -> forward model
-        }
     }
 }
 
@@ -388,9 +389,9 @@ fn record(
             .collect();
         online.assign_fragment(&mm, log_fm)
     });
-    let bias_w: Vec<f64> = if collecting {
+    let bias_w: std::borrow::Cow<'_, [f64]> = if collecting {
         if let Some(post) = &online_post {
-            post.clone()
+            std::borrow::Cow::Borrowed(post.as_slice())
         } else {
             let wsum: f64 = compat.iter().map(|(_, w)| *w).sum();
             compat
@@ -399,7 +400,7 @@ fn record(
                 .collect()
         }
     } else {
-        Vec::new()
+        std::borrow::Cow::Borrowed(&[])
     };
     // After burn-in salmon freezes model collection (still advances masses).
     let collect_now = collecting && sh.online.is_none_or(|o| o.collecting());

@@ -72,12 +72,14 @@ pub struct EmResult {
 }
 
 /// Relative-difference convergence check, matching salmon: the max over
-/// transcripts (with `alpha_in` above the cutoff) of
-/// `|alpha_out - alpha_in| / alpha_out`.
+/// transcripts (with `alpha_out` above the cutoff) of
+/// `|alpha_out - alpha_in| / alpha_out`. Returns `-inf` when no transcript
+/// clears the cutoff (e.g. no fragments at all), which counts as converged —
+/// as in salmon, where `converged` starts `true`.
 fn max_rel_diff(alpha_in: &[f64], alpha_out: &[f64], cutoff: f64) -> f64 {
     let mut max_d = f64::NEG_INFINITY;
     for i in 0..alpha_in.len() {
-        if alpha_in[i] > cutoff && alpha_out[i] > 0.0 {
+        if alpha_out[i] > cutoff {
             let d = (alpha_out[i] - alpha_in[i]).abs() / alpha_out[i];
             if d > max_d {
                 max_d = d;
@@ -244,7 +246,7 @@ pub(crate) fn run_em_counts(
         if it >= min_iter {
             let d = max_rel_diff(&alphas, &alphas_prime, opts.alpha_check_cutoff);
             std::mem::swap(&mut alphas, &mut alphas_prime);
-            if d.is_finite() && d < opts.rel_diff_tol {
+            if d < opts.rel_diff_tol {
                 converged = true;
                 break;
             }
@@ -315,6 +317,49 @@ mod tests {
         // VBEM with a tiny prior stays very close to the EM total.
         assert!((total - 200.0).abs() < 1.0, "total={total}");
         assert!(res.alphas[1] > res.alphas[0]);
+    }
+
+    #[test]
+    fn empty_input_converges_immediately() {
+        // No fragments: nothing clears the convergence cutoff, which must count
+        // as converged (not run to `max_iter`).
+        let p = PackedEqClasses::from_collapsed(&CollapsedEqClasses::default(), 3);
+        for use_vbem in [false, true] {
+            let opts = EmOptions {
+                use_vbem,
+                ..Default::default()
+            };
+            let res = optimize_packed(&p, &opts, true);
+            assert!(res.converged);
+            assert!(res.iters <= opts.min_iter.max(1), "iters={}", res.iters);
+            assert!(res.alphas.iter().all(|&a| a == 0.0));
+        }
+    }
+
+    #[test]
+    fn parallel_and_sequential_em_agree() {
+        let eq = build(
+            &[
+                (vec![0, 1, 2], 50),
+                (vec![1, 2], 30),
+                (vec![2], 20),
+                (vec![0, 3], 7),
+                (vec![3], 1),
+            ],
+            4,
+        );
+        let p = PackedEqClasses::from_collapsed(&eq, 4);
+        for use_vbem in [false, true] {
+            let opts = EmOptions {
+                use_vbem,
+                ..Default::default()
+            };
+            let a = optimize_packed(&p, &opts, true).alphas;
+            let b = optimize_packed(&p, &opts, false).alphas;
+            for (x, y) in a.iter().zip(&b) {
+                assert!((x - y).abs() < 1e-6, "{a:?} vs {b:?}");
+            }
+        }
     }
 
     #[test]

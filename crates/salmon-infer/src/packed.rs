@@ -127,16 +127,39 @@ pub(crate) fn em_step_seq(
     }
 }
 
+/// Class range `[start, end)` processed by shard `s` of `nshards`. Shards are
+/// balanced by label count (the actual per-class work), not class count, so a
+/// shard that happens to hold the long multi-mapping classes does not become
+/// the straggler every iteration.
+#[inline]
+fn shard_range(p: &PackedEqClasses, s: usize, nshards: usize) -> std::ops::Range<usize> {
+    let nclasses = p.num_classes();
+    let total = p.labels.len();
+    let bound = |k: usize| -> usize {
+        if k >= nshards {
+            return nclasses;
+        }
+        let target = ((total as u128 * k as u128) / nshards as u128) as u32;
+        // first class whose start offset is >= target
+        p.starts[..nclasses].partition_point(|&st| st < target)
+    };
+    bound(s)..bound(s + 1)
+}
+
 /// Reduce per-shard dense accumulators into `alpha_out` (one writer per `tid`,
 /// no contention). Parallelized over transcripts.
 fn reduce_shards(shards: &[Vec<f64>], alpha_out: &mut [f64]) {
-    alpha_out.par_iter_mut().enumerate().for_each(|(tid, out)| {
-        let mut s = 0.0;
-        for buf in shards {
-            s += buf[tid];
-        }
-        *out = s;
-    });
+    alpha_out
+        .par_iter_mut()
+        .enumerate()
+        .with_min_len(4096)
+        .for_each(|(tid, out)| {
+            let mut s = 0.0;
+            for buf in shards {
+                s += buf[tid];
+            }
+            *out = s;
+        });
 }
 
 /// Parallel EM M-step. Each shard owns a private dense `num_txps` buffer and
@@ -152,13 +175,10 @@ pub(crate) fn em_step_par(
     alpha_out: &mut [f64],
     shards: &mut [Vec<f64>],
 ) {
-    let nclasses = p.num_classes();
-    let chunk = nclasses.div_ceil(shards.len().max(1));
+    let nshards = shards.len().max(1);
     shards.par_iter_mut().enumerate().for_each(|(s, buf)| {
         buf.iter_mut().for_each(|x| *x = 0.0);
-        let start = s * chunk;
-        let end = ((s + 1) * chunk).min(nclasses);
-        for ci in start..end {
+        for ci in shard_range(p, s, nshards) {
             let count = counts[ci] as f64;
             let (tids, ws) = p.class(ci);
             if tids.len() > 1 {
@@ -196,6 +216,29 @@ fn fill_exp_theta(alpha_in: &[f64], prior_alphas: &[f64], exp_theta: &mut [f64])
             0.0
         };
     }
+}
+
+/// Parallel [`fill_exp_theta`]: the per-transcript `digamma` evaluations are
+/// the dominant serial cost of a VBEM iteration on large transcriptomes.
+fn fill_exp_theta_par(alpha_in: &[f64], prior_alphas: &[f64], exp_theta: &mut [f64]) {
+    let alpha_sum: f64 = alpha_in
+        .par_iter()
+        .zip(prior_alphas.par_iter())
+        .map(|(a, p)| a + p)
+        .sum();
+    let log_norm = digamma(alpha_sum);
+    exp_theta
+        .par_iter_mut()
+        .zip(alpha_in.par_iter().zip(prior_alphas.par_iter()))
+        .with_min_len(4096)
+        .for_each(|(et, (a, p))| {
+            let ap = a + p;
+            *et = if ap > DIGAMMA_MIN {
+                (digamma(ap) - log_norm).exp()
+            } else {
+                0.0
+            };
+        });
 }
 
 /// One sequential VBEM M-step (uses `exp_theta` in place of `alpha`).
@@ -246,15 +289,12 @@ pub(crate) fn vbem_step_par(
     exp_theta: &mut [f64],
     shards: &mut [Vec<f64>],
 ) {
-    fill_exp_theta(alpha_in, prior_alphas, exp_theta);
-    let nclasses = p.num_classes();
-    let chunk = nclasses.div_ceil(shards.len().max(1));
+    fill_exp_theta_par(alpha_in, prior_alphas, exp_theta);
+    let nshards = shards.len().max(1);
     let exp_theta: &[f64] = exp_theta;
     shards.par_iter_mut().enumerate().for_each(|(s, buf)| {
         buf.iter_mut().for_each(|x| *x = 0.0);
-        let start = s * chunk;
-        let end = ((s + 1) * chunk).min(nclasses);
-        for ci in start..end {
+        for ci in shard_range(p, s, nshards) {
             let count = counts[ci] as f64;
             let (tids, ws) = p.class(ci);
             if tids.len() > 1 {

@@ -143,20 +143,33 @@ impl FragmentLengthDistribution {
         if len > max_v {
             len = max_v;
         }
-        self.min.fetch_min(len, Ordering::Relaxed);
+        // Read first: the minimum rarely changes, and an unconditional RMW on
+        // this shared counter bounces its cache line between workers.
+        if len < self.min.load(Ordering::Relaxed) {
+            self.min.fetch_min(len, Ordering::Relaxed);
+        }
 
         let half = self.kernel.len() / 2;
         // offset can go negative conceptually; use isize math then bound-check.
         let mut offset = len as isize - half as isize;
+        // Accumulate the fragment's total and length-weighted mass locally and
+        // publish them with one atomic update each: `sum`/`tot_mass` are shared
+        // by every worker, so per-kernel-entry CAS loops on them contend.
+        let mut local_sum = LOG_0;
+        let mut local_tot = LOG_0;
         for &k in &self.kernel {
             if offset > 0 && (offset as usize) < self.hist.len() {
                 let o = offset as usize;
                 let k_mass = mass + k;
                 self.hist[o].log_add_assign(k_mass);
-                self.sum.log_add_assign((o as f64).ln() + k_mass);
-                self.tot_mass.log_add_assign(k_mass);
+                local_sum = log_add(local_sum, (o as f64).ln() + k_mass);
+                local_tot = log_add(local_tot, k_mass);
             }
             offset += 1;
+        }
+        if local_tot > LOG_0 {
+            self.sum.log_add_assign(local_sum);
+            self.tot_mass.log_add_assign(local_tot);
         }
     }
 

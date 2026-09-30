@@ -130,12 +130,11 @@ fn write_quant_sf(path: &Path, res: &QuantResult, sig_digits: usize) -> Result<(
         std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
     );
     writeln!(w, "Name\tLength\tEffectiveLength\tTPM\tNumReads")?;
-    // Decoy references (indices >= first_decoy_index) are never quantified and
+    // Decoy references (`decoy_range`) are never quantified and
     // are excluded from quant.sf, matching salmon.
     // salmon writes EffectiveLength and NumReads with `--sigDigits` decimals
     // (default 3) and TPM with the fixed `{:f}` (6-decimal) format.
-    let n = res.first_decoy_index.unwrap_or(res.names.len());
-    for i in 0..n {
+    for i in (0..res.names.len()).filter(|i| !res.decoy_range.contains(i)) {
         writeln!(
             w,
             "{}\t{}\t{:.*}\t{:.6}\t{:.*}",
@@ -209,7 +208,7 @@ fn write_lib_counts(path: &Path, opts: &QuantOptions, res: &QuantResult) -> Resu
         expected_format: res.library_type.clone(),
         compatible_fragment_ratio: 1.0,
         num_compatible_fragments: res.num_mapped,
-        num_assigned_fragments: res.num_mapped,
+        num_assigned_fragments: res.num_assigned,
         num_frags_with_concordant_consistent_mappings: res.num_mapped - res.num_orphan,
         num_frags_with_inconsistent_or_orphan_mappings: res.num_orphan,
         strand_mapping_bias: 0.0,
@@ -298,10 +297,8 @@ fn write_meta_info(path: &Path, opts: &QuantOptions, res: &QuantResult) -> Resul
         index_name_hash512: res.index_name_hash512.clone(),
         index_decoy_seq_hash: res.index_decoy_seq_hash.clone(),
         index_decoy_name_hash: res.index_decoy_name_hash.clone(),
-        num_valid_targets: res.first_decoy_index.unwrap_or(res.names.len()),
-        num_decoy_targets: res
-            .first_decoy_index
-            .map_or(0, |fdi| res.names.len().saturating_sub(fdi)),
+        num_valid_targets: res.names.len() - res.decoy_range.len(),
+        num_decoy_targets: res.decoy_range.len(),
         num_eq_classes: res.num_eq_classes,
         serialized_eq_classes: opts.dump_eq || opts.dump_eq_weights,
         eq_class_properties,

@@ -201,12 +201,15 @@ pub struct QuantResult {
     pub counts: Vec<f64>,
     pub num_processed: u64,
     pub num_mapped: u64,
+    /// mapped fragments that survived strand-compatibility filtering and were
+    /// assigned to an equivalence class
+    pub num_assigned: u64,
     /// mapped fragments placed as orphans (only one mate of a pair mapped)
     pub num_orphan: u64,
     pub num_eq_classes: usize,
-    /// index of the first decoy reference (`None` if the index has no decoys);
-    /// references at/after this are excluded from `quant.sf` and counted as decoys
-    pub first_decoy_index: Option<usize>,
+    /// reference ids of the decoy block (empty if the index has no decoys);
+    /// these are excluded from `quant.sf` and counted as decoys
+    pub decoy_range: std::ops::Range<usize>,
     /// whether the index collapsed duplicate sequences (for meta_info)
     pub keep_duplicates: bool,
     /// fragments dropped because their best alignment was to a decoy
@@ -242,7 +245,7 @@ pub struct QuantResult {
     /// when neither was requested
     pub bootstraps: Vec<Vec<f64>>,
     /// per-transcript (unique, ambiguous) fragment counts for `ambig_info.tsv`
-    pub ambig: (Vec<u32>, Vec<u32>),
+    pub ambig: (Vec<u64>, Vec<u64>),
     /// observed/expected bias-model tables for the aux dumps; each component is
     /// empty unless the corresponding `--seqBias`/`--gcBias`/`--posBias` ran
     pub bias_dump: BiasDump,
@@ -715,13 +718,18 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
     // The packed CSR layout (piscem-infer style) makes these parallel-friendly.
     let packed = salmon_infer::PackedEqClasses::from_collapsed(&collapsed, num_refs);
     let ambig = salmon_infer::ambiguity_counts(&packed);
-    let num_mapped_frags = num_mapped.load(Ordering::Relaxed);
+    // Replicates/samples are scaled to the fragments actually assigned to
+    // equivalence classes (what the point estimate's NumReads sums to), not the
+    // raw mapped count, which also includes fragments later dropped as
+    // strand-incompatible.
+    let num_mapped_frags = packed.total_count;
     let bootstraps: Vec<Vec<f64>> = if opts.skip_quant {
         Vec::new()
     } else if opts.num_bootstraps > 0 {
         salmon_infer::bootstrap(
             &packed,
             &opts.em,
+            Some(&eff_lengths),
             opts.num_bootstraps,
             num_mapped_frags,
             true, // useScaledCounts (selective-alignment, no orphan-only quasi)
@@ -731,7 +739,12 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
         // Gibbs prior follows the main optimizer (salmon): with VBEM and a
         // per-transcript prior it is `max(1.0, vbPrior)`; with plain EM it is
         // 1e-3 per transcript. The rust VBEM uses a constant per-transcript prior.
-        let prior = if opts.em.use_vbem {
+        // Under `--perNucleotidePrior` the Gibbs prior is `vbPrior` per
+        // nucleotide (scaled by effective length), matching the point estimate.
+        let per_nucleotide = opts.em.use_vbem && opts.em.per_nucleotide_prior;
+        let prior = if per_nucleotide {
+            opts.em.vb_prior
+        } else if opts.em.use_vbem {
             opts.em.vb_prior.max(1.0)
         } else {
             1e-3
@@ -740,7 +753,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             num_samples: opts.num_gibbs_samples,
             thinning: opts.thinning_factor,
             prior,
-            per_transcript_prior: true,
+            per_transcript_prior: !per_nucleotide,
         };
         salmon_infer::gibbs_sample(
             &packed,
@@ -786,9 +799,10 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
         counts,
         num_processed: num_processed.load(Ordering::Relaxed),
         num_mapped: num_mapped.load(Ordering::Relaxed),
+        num_assigned: num_mapped_frags,
         num_orphan: num_orphan.load(Ordering::Relaxed),
         num_eq_classes,
-        first_decoy_index: salmon.info().first_decoy_index,
+        decoy_range: salmon.info().decoy_range(),
         keep_duplicates: false,
         num_decoy_fragments: num_decoy.load(Ordering::Relaxed),
         num_dovetail_fragments: num_dovetail.load(Ordering::Relaxed),

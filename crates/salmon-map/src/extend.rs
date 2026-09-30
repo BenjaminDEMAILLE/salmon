@@ -138,7 +138,12 @@ pub fn candidates_from_raw_hits_unimems<R: RefProvider>(
         }
 
         for chain in chain_mems(&unimems, is_fw, &chain_cfg) {
-            candidates.push(MappingCandidate { tid, is_fw, chain });
+            candidates.push(MappingCandidate {
+                tid,
+                is_fw,
+                chain,
+                read_len: read.len() as i32,
+            });
         }
     }
     candidates
@@ -258,7 +263,12 @@ pub fn candidates_from_raw_hits_true_unimems<R: RefProvider>(
         }
 
         for chain in chain_mems(&unimems, is_fw, &chain_cfg) {
-            candidates.push(MappingCandidate { tid, is_fw, chain });
+            candidates.push(MappingCandidate {
+                tid,
+                is_fw,
+                chain,
+                read_len: read.len() as i32,
+            });
         }
     }
     candidates

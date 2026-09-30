@@ -11,7 +11,7 @@ use piscem_rs::index::reference_index::ReferenceIndex;
 use piscem_rs::mapping::hit_searcher::HitSearcher;
 use salmon_core::{LibraryFormat, MateStatus, ReadOrientation, ReadStrandedness, ReadType};
 
-use crate::align::{align_chain, align_in_window, revcomp, AlignConfig};
+use crate::align::{align_chain, align_in_window, align_query, revcomp, AlignConfig};
 use crate::collect::{
     best_per_target, collect_read_mems, consensus_filter, MappingCandidate, MemCollectorConfig,
 };
@@ -117,8 +117,14 @@ pub fn map_single_read<'idx, R: RefProvider>(
     let had_candidates = !cands.is_empty();
     let mut below = 0u32;
     let mut raw = Vec::with_capacity(cands.len());
+    let read_rc = if cands.iter().any(|c| !c.is_fw) {
+        revcomp(read)
+    } else {
+        Vec::new()
+    };
     for c in cands {
-        if let Some(aln) = align_chain(read, refs.ref_seq(c.tid), &c.chain, &cfg.align) {
+        let query = if c.is_fw { read } else { &read_rc[..] };
+        if let Some(aln) = align_query(query, refs.ref_seq(c.tid), &c.chain, &cfg.align) {
             if aln.valid {
                 // single-end observed strandedness: sense if forward, else antisense
                 let strand = if c.is_fw {
@@ -133,23 +139,24 @@ pub fn map_single_read<'idx, R: RefProvider>(
                     score: aln.score,
                     fragment_len: 0,
                     is_decoy: refs.is_decoy(c.tid),
-                    // 5' position: leftmost for a forward read, rightmost for a
-                    // reverse read (orientation-aware sequence-bias context).
+                    // 5' position: leftmost base for a forward read, rightmost
+                    // base (inclusive) for a reverse read (orientation-aware
+                    // sequence-bias context). Projected over unmatched read ends.
                     ref_pos: if c.is_fw {
-                        c.chain.ref_start()
+                        c.proj_start()
                     } else {
-                        c.chain.ref_end()
+                        c.proj_end() - 1
                     },
                     // positional bias: the read's leftmost reference coordinate,
                     // attributed to its own strand (salmon's SINGLE_END case).
-                    fw_pos: if c.is_fw { c.chain.ref_start() } else { -1 },
-                    rc_pos: if c.is_fw { -1 } else { c.chain.ref_start() },
+                    fw_pos: if c.is_fw { c.proj_start().max(0) } else { -1 },
+                    rc_pos: if c.is_fw { -1 } else { c.proj_start().max(0) },
                     format: Some(LibraryFormat::new(
                         ReadType::SingleEnd,
                         ReadOrientation::None,
                         strand,
                     )),
-                    r1_pos: c.chain.ref_start(),
+                    r1_pos: c.proj_start(),
                     r2_pos: -1,
                     r2_fw: false,
                     r1_score: aln.score,
@@ -195,6 +202,12 @@ pub fn map_read_pair<'idx, R: RefProvider>(
     let mut below = 0u32;
     let mut dovetail = false;
     let mut raw = Vec::new();
+    // Reverse complements computed once per fragment, not per joint mapping.
+    let (r1_rc, r2_rc) = if had_candidates {
+        (revcomp(r1), revcomp(r2))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     for j in joints {
         match j.status {
             MateStatus::PairedEndPaired => {
@@ -205,13 +218,23 @@ pub fn map_read_pair<'idx, R: RefProvider>(
                 // past each other's start (salmon's `num_dovetail_fragments`).
                 if l.is_fw != r.is_fw {
                     let (fw, rc) = if l.is_fw { (l, r) } else { (r, l) };
-                    if rc.chain.ref_start() < fw.chain.ref_start() {
+                    if rc.proj_start() < fw.proj_start() {
                         dovetail = true;
                     }
                 }
                 let refseq = refs.ref_seq(j.tid);
-                let al = align_chain(r1, refseq, &l.chain, &cfg.align);
-                let ar = align_chain(r2, refseq, &r.chain, &cfg.align);
+                let al = align_query(
+                    if l.is_fw { r1 } else { &r1_rc },
+                    refseq,
+                    &l.chain,
+                    &cfg.align,
+                );
+                let ar = align_query(
+                    if r.is_fw { r2 } else { &r2_rc },
+                    refseq,
+                    &r.chain,
+                    &cfg.align,
+                );
                 if let (Some(al), Some(ar)) = (al, ar) {
                     if al.valid && ar.valid {
                         // positional bias (salmon's PAIRED_END_PAIRED case): only
@@ -222,9 +245,9 @@ pub fn map_read_pair<'idx, R: RefProvider>(
                         // the fragment 3' end, not the reverse mate's leftmost (which
                         // is 3'end - readLen) — fixing a coordinate mismatch between
                         // the observed and expected 3' positional models.
-                        let frag_start = l.chain.ref_start().min(r.chain.ref_start());
+                        let frag_start = l.proj_start().min(r.proj_start());
                         let (fw_pos, rc_pos) = if l.is_fw != r.is_fw {
-                            (frag_start, frag_start + j.fragment_len - 1)
+                            (frag_start.max(0), frag_start + j.fragment_len - 1)
                         } else {
                             (-1, -1)
                         };
@@ -235,12 +258,12 @@ pub fn map_read_pair<'idx, R: RefProvider>(
                             score: al.score + ar.score,
                             fragment_len: j.fragment_len,
                             is_decoy: refs.is_decoy(j.tid),
-                            ref_pos: l.chain.ref_start().min(r.chain.ref_start()),
+                            ref_pos: frag_start,
                             fw_pos,
                             rc_pos,
                             format: Some(j.format),
-                            r1_pos: l.chain.ref_start(),
-                            r2_pos: r.chain.ref_start(),
+                            r1_pos: l.proj_start(),
+                            r2_pos: r.proj_start(),
                             r2_fw: r.is_fw,
                             r1_score: al.score,
                         });
@@ -330,7 +353,7 @@ fn orphan_raw(
     is_left: bool,
     is_decoy: bool,
 ) -> RawMapping {
-    let start = c.chain.ref_start();
+    let start = c.proj_start();
     RawMapping {
         tid,
         is_fw: c.is_fw,
@@ -342,9 +365,10 @@ fn orphan_raw(
         score,
         fragment_len: 0,
         is_decoy,
-        ref_pos: start,
-        fw_pos: if c.is_fw { start } else { -1 },
-        rc_pos: if c.is_fw { -1 } else { start },
+        // 5' position, as for a single-end read
+        ref_pos: if c.is_fw { start } else { c.proj_end() - 1 },
+        fw_pos: if c.is_fw { start.max(0) } else { -1 },
+        rc_pos: if c.is_fw { -1 } else { start.max(0) },
         format: None,
         r1_pos: if is_left { start } else { -1 },
         r2_pos: if is_left { -1 } else { start },
@@ -389,7 +413,7 @@ pub fn debug_best_mapping<'idx, R: RefProvider>(
     Some(DebugMapping {
         tid: best.tid,
         is_fw: best.is_fw,
-        ref_pos: best.chain.ref_start(),
+        ref_pos: best.proj_start(),
         chain_cov: best.chain.covered_read_bases(),
         read_len: read.len(),
         full_score: aln.score,
@@ -426,39 +450,48 @@ fn push_orphan_or_recovered<R: RefProvider>(
 
     if cfg.recover_orphans {
         if let Some((partner_score, frag_len)) = recover_mate(partner_read, refseq, anchor, cfg) {
+            // Leftmost base of the fragment and of the recovered partner: a
+            // forward anchor starts the fragment and the partner ends it; a
+            // reverse anchor ends it and the partner starts it.
+            let (frag_start, partner_start) = if anchor.is_fw {
+                let fs = anchor.proj_start();
+                (fs, fs + frag_len - partner_read.len() as i32)
+            } else {
+                let fs = anchor.proj_end() - frag_len;
+                (fs, fs)
+            };
+            let anchor_start = anchor.proj_start();
+            // `is_fw` is mate 1's orientation (SAM flags, library format);
+            // the partner maps to the opposite strand of the anchor.
+            let (r1_fw, r2_fw) = if anchor_is_left {
+                (anchor.is_fw, !anchor.is_fw)
+            } else {
+                (!anchor.is_fw, anchor.is_fw)
+            };
             raw.push(RawMapping {
                 tid,
-                is_fw: anchor.is_fw,
+                is_fw: r1_fw,
                 status: MateStatus::PairedEndPaired,
                 score: anchor_aln.score + partner_score,
                 fragment_len: frag_len,
                 is_decoy,
-                ref_pos: anchor.chain.ref_start(),
-                // orientation not re-derived for recovered pairs; attribute the
-                // anchor's position to its own strand for positional bias.
-                fw_pos: if anchor.is_fw {
-                    anchor.chain.ref_start()
-                } else {
-                    -1
-                },
-                rc_pos: if anchor.is_fw {
-                    -1
-                } else {
-                    anchor.chain.ref_start()
-                },
+                ref_pos: frag_start,
+                // opposite-strand pair: fragment 5' start and 3' end, as for a
+                // concordant pair.
+                fw_pos: frag_start.max(0),
+                rc_pos: frag_start + frag_len - 1,
                 format: None, // recovered pair: orientation not re-derived
-                // SAM: the partner's leftmost is estimated from the fragment length.
                 r1_pos: if anchor_is_left {
-                    anchor.chain.ref_start()
+                    anchor_start
                 } else {
-                    (anchor.chain.ref_start() + frag_len - partner_read.len() as i32).max(0)
+                    partner_start
                 },
                 r2_pos: if anchor_is_left {
-                    (anchor.chain.ref_start() + frag_len - partner_read.len() as i32).max(0)
+                    partner_start
                 } else {
-                    anchor.chain.ref_start()
+                    anchor_start
                 },
-                r2_fw: !anchor.is_fw,
+                r2_fw,
                 r1_score: if anchor_is_left {
                     anchor_aln.score
                 } else {
@@ -469,6 +502,7 @@ fn push_orphan_or_recovered<R: RefProvider>(
         }
     }
 
+    let anchor_start = anchor.proj_start();
     let status = if anchor_is_left {
         MateStatus::PairedEndLeft
     } else {
@@ -481,29 +515,26 @@ fn push_orphan_or_recovered<R: RefProvider>(
         score: anchor_aln.score,
         fragment_len: 0,
         is_decoy,
-        ref_pos: anchor.chain.ref_start(),
+        // 5' position, as for a single-end read
+        ref_pos: if anchor.is_fw {
+            anchor_start
+        } else {
+            anchor.proj_end() - 1
+        },
         // orphan: leftmost coordinate attributed to its own strand.
         fw_pos: if anchor.is_fw {
-            anchor.chain.ref_start()
+            anchor_start.max(0)
         } else {
             -1
         },
         rc_pos: if anchor.is_fw {
             -1
         } else {
-            anchor.chain.ref_start()
+            anchor_start.max(0)
         },
         format: None, // orphans are not sampled for library-type detection
-        r1_pos: if anchor_is_left {
-            anchor.chain.ref_start()
-        } else {
-            -1
-        },
-        r2_pos: if anchor_is_left {
-            -1
-        } else {
-            anchor.chain.ref_start()
-        },
+        r1_pos: if anchor_is_left { anchor_start } else { -1 },
+        r2_pos: if anchor_is_left { -1 } else { anchor_start },
         r2_fw: false,
         r1_score: anchor_aln.score,
     });
@@ -519,12 +550,13 @@ fn recover_mate(
 ) -> Option<(i32, i32)> {
     let max_frag = cfg.pair.max_fragment_len;
     let reflen = refseq.len() as i32;
-    let a_s = anchor.chain.ref_start();
-    let a_e = anchor.chain.ref_end();
+    // Projected read extent (may overhang the transcript ends).
+    let a_s = anchor.proj_start();
+    let a_e = anchor.proj_end();
 
     if anchor.is_fw {
         // The partner lies downstream and maps to the reverse strand.
-        let win_start = a_s;
+        let win_start = a_s.max(0);
         let win_end = (a_s + max_frag).min(reflen);
         if win_end <= win_start {
             return None;
@@ -538,11 +570,11 @@ fn recover_mate(
         if !aln.valid {
             return None;
         }
-        // partner ends `end_col` bases past the anchor start -> fragment length
-        Some((aln.score, aln.end_col as i32))
+        // partner ends `end_col` bases past the window start -> fragment length
+        Some((aln.score, win_start - a_s + aln.end_col as i32))
     } else {
         // The partner lies upstream and maps to the forward strand.
-        let win_end = a_e;
+        let win_end = a_e.min(reflen);
         let win_start = (a_e - max_frag).max(0);
         if win_end <= win_start {
             return None;

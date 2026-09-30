@@ -251,13 +251,13 @@ impl EquivalenceClassBuilder {
     }
 
     /// Finalize into a flat, index-stable collection for inference. Classes are
-    /// sorted by their transcript label for determinism.
+    /// sorted by their full label (`txps`, then range-factorization `bins`) so
+    /// the order — and hence seeded bootstrap resampling and the parallel EM's
+    /// summation order — does not depend on thread interleaving.
     pub fn finish(self) -> CollapsedEqClasses {
-        let mut classes: Vec<(TranscriptGroup, TGValue)> = Vec::with_capacity(self.map.len());
-        self.map
-            .iter()
-            .for_each(|e| classes.push((e.key().clone(), e.value().clone())));
-        classes.sort_by(|a, b| a.0.txps.cmp(&b.0.txps));
+        // Consume the map (no deep clone of every label and weight vector).
+        let mut classes: Vec<(TranscriptGroup, TGValue)> = self.map.into_iter().collect();
+        classes.sort_unstable_by(|a, b| (&a.0.txps, &a.0.bins).cmp(&(&b.0.txps, &b.0.bins)));
         let total_count = classes.iter().map(|(_, v)| v.count).sum();
         CollapsedEqClasses {
             classes,

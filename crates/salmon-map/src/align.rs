@@ -118,16 +118,25 @@ pub fn align_chain(
     chain: &MemChain,
     cfg: &AlignConfig,
 ) -> Option<Alignment> {
-    if read.is_empty() || ref_seq.is_empty() {
+    if chain.is_fw {
+        align_query(read, ref_seq, chain, cfg)
+    } else {
+        align_query(&revcomp(read), ref_seq, chain, cfg)
+    }
+}
+
+/// As [`align_chain`], but `query` is already in the reference-forward frame
+/// (the read for a forward chain, its reverse complement otherwise). Lets the
+/// mapper reverse-complement each read once instead of once per candidate.
+pub fn align_query(
+    query: &[u8],
+    ref_seq: &[u8],
+    chain: &MemChain,
+    cfg: &AlignConfig,
+) -> Option<Alignment> {
+    if query.is_empty() || ref_seq.is_empty() {
         return None;
     }
-
-    // Query in the reference-forward frame.
-    let query: Vec<u8> = if chain.is_fw {
-        read.to_vec()
-    } else {
-        revcomp(read)
-    };
     let qlen = query.len() as i32;
     let diag_origin = chain.ref_start() - chain.read_start();
     let win_start = diag_origin.max(0);
@@ -139,10 +148,10 @@ pub fn align_chain(
             return None;
         }
         let rwin = &ref_seq[win_start as usize..win_end as usize];
-        ksw2_align_score(&query, rwin, cfg)
+        ksw2_align_score(query, rwin, cfg)
     } else {
         // PuffAligner-style: exact-MEM segments + DP of inter-MEM gaps/flanks.
-        anchored_align_score(&query, ref_seq, &chain.mems, cfg)
+        anchored_align_score(query, ref_seq, &chain.mems, cfg)
     };
 
     let valid = score > min_accepted_score(query.len(), cfg);
@@ -161,8 +170,42 @@ thread_local! {
     /// read). salmon scopes this cache per read; we instead bound it by size
     /// (see [`GAP_CACHE_CAP`]) so it cannot grow without limit over a whole run
     /// — an unbounded thread-local here cost tens of GB on a 36M-read library.
-    static GAP_CACHE: std::cell::RefCell<ahash::AHashMap<(Box<[u8]>, Box<[u8]>), i32>> =
-        std::cell::RefCell::new(ahash::AHashMap::new());
+    static GAP_CACHE: std::cell::RefCell<GapCache> = std::cell::RefCell::new(GapCache::default());
+}
+
+/// Thread-local DP score cache. Keys are a single flat byte string
+/// `[kind, qlen (4 bytes LE), query.., ref..]` built in a reused buffer, so a
+/// lookup (the common case) allocates nothing; only a miss boxes the key.
+#[derive(Default)]
+struct GapCache {
+    map: ahash::AHashMap<Box<[u8]>, i32>,
+    key: Vec<u8>,
+}
+
+/// Cache-key kinds (keep gap and the two flank orientations disjoint).
+const KEY_GAP: u8 = 0;
+const KEY_FLANK_LEFT: u8 = 1;
+const KEY_FLANK_RIGHT: u8 = 2;
+
+impl GapCache {
+    /// Look up `(kind, q, t)`, computing and inserting it with `f` on a miss.
+    #[inline]
+    fn get_or_compute(&mut self, kind: u8, q: &[u8], t: &[u8], f: impl FnOnce() -> i32) -> i32 {
+        self.key.clear();
+        self.key.push(kind);
+        self.key.extend_from_slice(&(q.len() as u32).to_le_bytes());
+        self.key.extend_from_slice(q);
+        self.key.extend_from_slice(t);
+        if let Some(&s) = self.map.get(self.key.as_slice()) {
+            return s;
+        }
+        let s = f();
+        if self.map.len() >= GAP_CACHE_CAP {
+            self.map.clear();
+        }
+        self.map.insert(self.key.as_slice().into(), s);
+        s
+    }
 }
 
 /// Maximum number of cached (query, ref) DP scores per thread. The cache exists
@@ -171,20 +214,6 @@ thread_local! {
 /// (flanks are read-specific). When the cap is hit we clear the whole cache,
 /// keeping peak memory at a few MB per thread instead of unbounded growth.
 const GAP_CACHE_CAP: usize = 32_768;
-
-/// Insert into the gap/flank cache, clearing it first if it has reached the cap.
-#[inline]
-fn gap_cache_insert(
-    c: &std::cell::RefCell<ahash::AHashMap<(Box<[u8]>, Box<[u8]>), i32>>,
-    key: (Box<[u8]>, Box<[u8]>),
-    score: i32,
-) {
-    let mut m = c.borrow_mut();
-    if m.len() >= GAP_CACHE_CAP {
-        m.clear();
-    }
-    m.insert(key, score);
-}
 
 /// PuffAligner-style score: each MEM contributes an exact-match score and only
 /// the inter-MEM gaps and the read flanks are DP-aligned (with ksw2), reusing
@@ -235,7 +264,9 @@ fn anchored_align_score(
             //    absorbed as a plain overlap (which inflated the score).
             let ov = read_ov.max(ref_ov).max(0);
             score -= ov * m;
-            let q_lo = (mem.read_end() - ov).max(mem.read_start).min(nxt.read_start) as usize;
+            let q_lo = (mem.read_end() - ov)
+                .max(mem.read_start)
+                .min(nxt.read_start) as usize;
             let t_lo = (mem.ref_end() - ov).max(mem.ref_start).min(nxt.ref_start) as usize;
             let qg = &query[q_lo..nxt.read_start as usize];
             let tg = &ref_seq[t_lo..nxt.ref_start as usize];
@@ -379,16 +410,8 @@ fn cached_gap_score(qg: &[u8], tg: &[u8], cfg: &AlignConfig) -> i32 {
         return 0;
     }
     GAP_CACHE.with(|c| {
-        let key = (
-            qg.to_vec().into_boxed_slice(),
-            tg.to_vec().into_boxed_slice(),
-        );
-        if let Some(&s) = c.borrow().get(&key) {
-            return s;
-        }
-        let s = ksw2_gap_global(qg, tg, cfg);
-        gap_cache_insert(c, key, s);
-        s
+        c.borrow_mut()
+            .get_or_compute(KEY_GAP, qg, tg, || ksw2_gap_global(qg, tg, cfg))
     })
 }
 
@@ -396,17 +419,15 @@ fn cached_flank_score(qf: &[u8], tf: &[u8], cfg: &AlignConfig, anchor_right: boo
     if qf.is_empty() {
         return 0;
     }
+    let kind = if anchor_right {
+        KEY_FLANK_RIGHT
+    } else {
+        KEY_FLANK_LEFT
+    };
     GAP_CACHE.with(|c| {
-        // distinguish flank orientation in the key
-        let mut qk = qf.to_vec();
-        qk.push(if anchor_right { 1 } else { 0 });
-        let key = (qk.into_boxed_slice(), tf.to_vec().into_boxed_slice());
-        if let Some(&s) = c.borrow().get(&key) {
-            return s;
-        }
-        let s = ksw2_flank_extend(qf, tf, cfg, anchor_right);
-        gap_cache_insert(c, key, s);
-        s
+        c.borrow_mut().get_or_compute(kind, qf, tf, || {
+            ksw2_flank_extend(qf, tf, cfg, anchor_right)
+        })
     })
 }
 
@@ -654,11 +675,14 @@ mod tests {
         let score = anchored_align_score(&query, &reference, &mems, &cfg);
         // Old (buggy) behavior absorbed the indel as a 4-base overlap only:
         let absorbed = (45 + 32) * m - 4 * m; // = 146
-        // Fixed: 73 matched bases minus a 3 bp affine gap (open + 3*extend).
+                                              // Fixed: 73 matched bases minus a 3 bp affine gap (open + 3*extend).
         let gap = cfg.gap_open_pen as i32 + 3 * cfg.gap_extend_pen as i32;
         let expected = (45 + 32 - 4) * m - gap; // 146 - 12 = 134
         assert_eq!(score, expected, "expected indel-penalized score");
-        assert!(score < absorbed, "indel was not penalized: {score} >= {absorbed}");
+        assert!(
+            score < absorbed,
+            "indel was not penalized: {score} >= {absorbed}"
+        );
     }
 
     #[test]

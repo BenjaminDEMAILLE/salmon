@@ -21,12 +21,14 @@ const MIN_EQ_CLASS_WEIGHT: f64 = f64::MIN_POSITIVE;
 
 /// Draw a multinomial count vector: `total` draws over categories with the given
 /// (non-normalized) `weights`, via the conditional-binomial method — `O(k)` in
-/// the number of categories rather than `O(total)` individual draws.
-fn multinomial(total: u64, weights: &[f64], rng: &mut impl Rng) -> Vec<u64> {
+/// the number of categories rather than `O(total)` individual draws. Writes into
+/// `out` (resized to `weights.len()`) so hot loops can reuse the buffer.
+fn multinomial_into(total: u64, weights: &[f64], rng: &mut impl Rng, out: &mut Vec<u64>) {
     let n = weights.len();
-    let mut out = vec![0u64; n];
+    out.clear();
+    out.resize(n, 0);
     if total == 0 || n == 0 {
-        return out;
+        return;
     }
     let mut remaining = total;
     let mut remaining_w: f64 = weights.iter().sum();
@@ -50,17 +52,19 @@ fn multinomial(total: u64, weights: &[f64], rng: &mut impl Rng) -> Vec<u64> {
         remaining -= k;
         remaining_w -= weights[i];
     }
-    out
 }
 
 /// Run `num_bootstraps` multinomial bootstrap replicates. Each resamples the
 /// per-class counts (multinomial over the original counts, `total_count` draws),
 /// runs EM/VBEM to convergence (min 50 iters), and — when `scale_counts` (salmon's
 /// `useScaledCounts`) — rescales the abundances to sum to `num_mapped_frags`.
-/// Returns one abundance vector per replicate.
+/// `eff_lens` is required for the VBEM per-nucleotide prior (so replicates use
+/// the same model as the point estimate). Returns one abundance vector per
+/// replicate.
 pub fn bootstrap(
     p: &PackedEqClasses,
     opts: &EmOptions,
+    eff_lens: Option<&[f64]>,
     num_bootstraps: u32,
     num_mapped_frags: u64,
     scale_counts: bool,
@@ -73,8 +77,9 @@ pub fn bootstrap(
         .map(|bs| {
             let mut rng =
                 Pcg64Mcg::seed_from_u64(seed ^ (bs as u64).wrapping_mul(0x9E3779B97F4A7C15));
-            let resampled = multinomial(total, &sample_weights, &mut rng);
-            let (mut alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, None, None);
+            let mut resampled = Vec::new();
+            multinomial_into(total, &sample_weights, &mut rng, &mut resampled);
+            let (mut alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, None, eff_lens);
             // truncate tiny values
             for a in &mut alphas {
                 if *a < opts.min_alpha {
@@ -134,6 +139,8 @@ fn gibbs_round(
     txp_count: &mut [f64],
     mu: &mut [f64],
     rng: &mut impl Rng,
+    probs: &mut Vec<f64>,
+    draws: &mut Vec<u64>,
 ) {
     // Sample mu[i] ~ Gamma(txpCount[i] + prior[i], 1/(beta + effLen[i])); reset count.
     for &i in active {
@@ -148,7 +155,6 @@ fn gibbs_round(
         txp_count[i] = 0.0;
     }
     // Resample each class's reads across its transcripts.
-    let mut probs: Vec<f64> = Vec::with_capacity(64);
     for ci in 0..p.num_classes() {
         let class_count = p.counts[ci];
         let s = p.starts[ci] as usize;
@@ -169,8 +175,8 @@ fn gibbs_round(
                     *v = 1.0;
                 }
             }
-            let draws = multinomial(class_count, &probs, rng);
-            for (&tid, &k) in tids.iter().zip(&draws) {
+            multinomial_into(class_count, probs, rng, draws);
+            for (&tid, &k) in tids.iter().zip(draws.iter()) {
                 txp_count[tid as usize] += k as f64;
             }
         } else {
@@ -259,6 +265,8 @@ pub fn gibbs_sample(
                 Pcg64Mcg::seed_from_u64(seed ^ (c as u64).wrapping_mul(0xD1B54A32D192ED03));
             let mut txp_count = init.clone();
             let mut mu = vec![0.0f64; num_txps];
+            let mut probs: Vec<f64> = Vec::with_capacity(64);
+            let mut draws: Vec<u64> = Vec::with_capacity(64);
             let mut out: Vec<Vec<f64>> = Vec::with_capacity(end - start);
             for _ in start..end {
                 for _ in 0..opts.thinning {
@@ -270,6 +278,8 @@ pub fn gibbs_sample(
                         &mut txp_count,
                         &mut mu,
                         &mut rng,
+                        &mut probs,
+                        &mut draws,
                     );
                 }
                 // Extrapolate scaled counts from the final fractions mu.
@@ -300,14 +310,14 @@ pub fn gibbs_sample(
 /// Per-transcript unique / ambiguous fragment counts (salmon's `ambig_info.tsv`):
 /// `unique[t]` sums counts of single-transcript classes for `t`; `ambig[t]` sums
 /// counts of every multi-transcript class containing `t`.
-pub fn ambiguity_counts(p: &PackedEqClasses) -> (Vec<u32>, Vec<u32>) {
-    let mut unique = vec![0u32; p.num_txps];
-    let mut ambig = vec![0u32; p.num_txps];
+pub fn ambiguity_counts(p: &PackedEqClasses) -> (Vec<u64>, Vec<u64>) {
+    let mut unique = vec![0u64; p.num_txps];
+    let mut ambig = vec![0u64; p.num_txps];
     for ci in 0..p.num_classes() {
         let s = p.starts[ci] as usize;
         let e = p.starts[ci + 1] as usize;
         let tids = &p.labels[s..e];
-        let count = p.counts[ci] as u32;
+        let count = p.counts[ci];
         if tids.len() > 1 {
             for &t in tids {
                 ambig[t as usize] += count;
@@ -342,7 +352,7 @@ mod tests {
     fn bootstrap_mean_near_point_estimate() {
         // unique evidence -> every bootstrap recovers ~the same counts
         let p = packed(&[(vec![0], 300), (vec![1], 700)], 2);
-        let bs = bootstrap(&p, &EmOptions::default(), 50, 1000, true, 12345);
+        let bs = bootstrap(&p, &EmOptions::default(), None, 50, 1000, true, 12345);
         assert_eq!(bs.len(), 50);
         let m0: f64 = bs.iter().map(|b| b[0]).sum::<f64>() / 50.0;
         let m1: f64 = bs.iter().map(|b| b[1]).sum::<f64>() / 50.0;
@@ -358,7 +368,7 @@ mod tests {
     fn bootstrap_variance_grows_with_ambiguity() {
         // a fully shared class has higher per-transcript bootstrap variance
         let p = packed(&[(vec![0], 10), (vec![1], 10), (vec![0, 1], 980)], 2);
-        let bs = bootstrap(&p, &EmOptions::default(), 100, 1000, true, 7);
+        let bs = bootstrap(&p, &EmOptions::default(), None, 100, 1000, true, 7);
         let m0: f64 = bs.iter().map(|b| b[0]).sum::<f64>() / 100.0;
         let var0: f64 = bs.iter().map(|b| (b[0] - m0).powi(2)).sum::<f64>() / 100.0;
         assert!(

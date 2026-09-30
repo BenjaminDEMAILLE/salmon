@@ -360,7 +360,8 @@ struct QuantArgs {
     #[arg(long = "numGibbsSamples", default_value_t = 0)]
     num_gibbs_samples: u32,
     /// Gibbs thinning factor.
-    #[arg(long = "thinningFactor", default_value_t = 16)]
+    #[arg(long = "thinningFactor", default_value_t = 16,
+          value_parser = clap::value_parser!(u32).range(1..))]
     thinning_factor: u32,
     /// (Long reads) Oxford Nanopore model — not supported; use oarfish instead.
     #[arg(long = "ont")]
@@ -386,16 +387,21 @@ struct QuantArgs {
     #[arg(long = "uniMEMs", conflicts_with = "refmems")]
     unimems: bool,
     /// Match score for selective alignment (reads mode).
-    #[arg(long = "ma", default_value_t = 2)]
+    #[arg(long = "ma", default_value_t = 2,
+          value_parser = clap::value_parser!(i32).range(1..=127))]
     ma: i32,
-    /// Mismatch penalty for selective alignment (reads mode).
-    #[arg(long = "mp", default_value_t = 4)]
+    /// Mismatch penalty for selective alignment (reads mode). The magnitude is
+    /// used, so salmon's negative convention (`--mp -4`) is also accepted.
+    #[arg(long = "mp", default_value_t = 4, allow_negative_numbers = true,
+          value_parser = clap::value_parser!(i32).range(-127..=127))]
     mp: i32,
     /// Gap-open penalty for selective alignment (reads mode).
-    #[arg(long = "go", default_value_t = 6)]
+    #[arg(long = "go", default_value_t = 6,
+          value_parser = clap::value_parser!(i32).range(0..=127))]
     go: i32,
     /// Gap-extend penalty for selective alignment (reads mode).
-    #[arg(long = "ge", default_value_t = 2)]
+    #[arg(long = "ge", default_value_t = 2,
+          value_parser = clap::value_parser!(i32).range(0..=127))]
     ge: i32,
     /// Consensus slack: a target is kept only if its best chain score is at least
     /// `(1 - slack)` of the max chain score for that mate (salmon default 0.35;
@@ -503,11 +509,13 @@ struct QuantArgs {
     #[arg(long = "numErrorBins", default_value_t = 4)]
     num_error_bins: usize,
     /// Number of fragment-GC bins for the GC bias model. (salmon's --numGCBins)
-    #[arg(long = "numGCBins", default_value_t = 25)]
+    #[arg(long = "numGCBins", default_value_t = 25,
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=101))]
     num_gc_bins: usize,
     /// Number of conditioning (context) bins for the GC bias model.
     /// (salmon's --conditionalGCBins)
-    #[arg(long = "conditionalGCBins", default_value_t = 3)]
+    #[arg(long = "conditionalGCBins", default_value_t = 3,
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=101))]
     conditional_gc_bins: usize,
     /// Discard orphan (single-mate) alignments in a paired library
     /// (alignment mode). Reads mode uses --discardOrphansQuasi.
@@ -696,6 +704,20 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
             "--maxRecoverReadOcc is accepted but not yet implemented and has no effect."
         );
     }
+    anyhow::ensure!(
+        args.fld_sd.is_finite() && args.fld_sd > 0.0,
+        "--fldSD must be a positive number (got {})",
+        args.fld_sd
+    );
+    anyhow::ensure!(
+        args.fld_mean.is_finite() && args.fld_mean > 0.0,
+        "--fldMean must be a positive number (got {})",
+        args.fld_mean
+    );
+    anyhow::ensure!(
+        args.num_bootstraps == 0 || args.num_gibbs_samples == 0,
+        "--numBootstraps and --numGibbsSamples are mutually exclusive"
+    );
     if args.validate_mappings {
         tracing::warn!("--validateMappings has no effect (deprecated in salmon too): selective alignment is the default mapping mode; pass --sketch for pseudoalignment.");
     }
@@ -730,6 +752,25 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
     }
     // Alignment-based mode: quantify directly from a BAM.
     if let Some(bam) = args.alignments {
+        // Reads-mode-only options: warn rather than silently ignore them.
+        let ignored: [(&str, bool); 8] = [
+            ("--numBootstraps", args.num_bootstraps > 0),
+            ("--numGibbsSamples", args.num_gibbs_samples > 0),
+            ("--noLengthCorrection", args.no_length_correction),
+            ("--dumpEq", args.dump_eq),
+            ("--dumpEqWeights", args.dump_eq_weights),
+            ("--writeUnmappedNames", args.write_unmapped_names),
+            ("--writeMappings", args.write_mappings.is_some()),
+            ("--perTranscriptPrior", args.per_transcript_prior),
+        ];
+        for (flag, set) in ignored {
+            if set {
+                tracing::warn!("{flag} is not supported in alignment (-a) mode and is ignored.");
+            }
+        }
+        if args.lib_type == "A" {
+            tracing::warn!("automatic library-type detection (-l A) is not implemented in alignment (-a) mode; the library is treated as paired-end with no orientation filtering. Pass an explicit -l (e.g. -l U or -l SR for single-end data) for correct results.");
+        }
         let mut opts = AlignQuantOptions::new(bam, args.output);
         opts.lib_type = args.lib_type;
         opts.em.use_vbem = use_vbem;
@@ -858,7 +899,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
     opts.map_config.seed_mode = seed_mode(args.unimems, args.refmems);
     // alignment scoring (selective alignment)
     opts.map_config.align.match_score = args.ma as i8;
-    opts.map_config.align.mismatch_pen = args.mp as i8;
+    opts.map_config.align.mismatch_pen = args.mp.unsigned_abs() as i8;
     opts.map_config.align.gap_open_pen = args.go as i8;
     opts.map_config.align.gap_extend_pen = args.ge as i8;
     // chaining consensus + repetitive-hit guard
