@@ -1356,6 +1356,9 @@ struct BiasCfg<'a> {
     ref_bytes: &'a salmon_core::RefSeqs,
     gc_store: &'a GcStore<'a>,
     length_class: Option<&'a [usize]>,
+    /// references whose share of a fragment is not observed (unspliced
+    /// targets): the bias models are trained on spliced targets only
+    exclude: Option<&'a [bool]>,
 }
 
 /// Collect one fragment's sequence/GC/positional bias contributions, weighted by
@@ -1504,6 +1507,12 @@ fn collect_bias_fragment(
     for ((run, &glog), &p_tid) in groups().zip(group_log.iter()).zip(post.iter()) {
         let tid = &run[0].tid;
         if p_tid <= 0.0 {
+            continue;
+        }
+        if cfg
+            .exclude
+            .is_some_and(|x| x.get(*tid as usize).copied().unwrap_or(false))
+        {
             continue;
         }
         // Sequence/GC need the reference bytes; positional bias needs only the
@@ -1826,6 +1835,18 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
         }
         None => None,
     };
+    // End of the decoy block; any tail after it (sub-k transcripts, projected
+    // unspliced targets) is quantified and bias-corrected.
+    let decoy_end = provenance
+        .index
+        .as_ref()
+        .and_then(|ix| match (ix.first_decoy_index, ix.num_decoys) {
+            // A RAD that did not record the block size treats everything from
+            // the first decoy on as decoy, as before.
+            (Some(f), Some(n)) if n > 0 => Some(f as usize + n as usize),
+            _ => None,
+        })
+        .map_or(num_refs, |e| e.min(num_refs));
     // Long unspliced targets are visited at a position stride in the bias
     // sweeps (spliced targets exactly, stride 1); `None` for any other index.
     let bias_pos_stride: Option<Vec<usize>> = splice_table.as_ref().map(|t| {
@@ -2114,6 +2135,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
                 ref_bytes: &ref_bytes,
                 gc_store: &gc_store,
                 length_class: length_class.as_deref(),
+                exclude: splice_table.as_ref().map(|t| t.unspliced.as_slice()),
             };
             let obs = match profile {
                 RadInputProfile::PiscemBulk => run_rad_eq_and_bias_pass::<PiscemBulkReadRecord>(
@@ -2247,6 +2269,8 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
             opts.bias_speed_samp,
             opts.no_bias_length_threshold,
             bias_pos_stride.as_deref(),
+            splice_table.as_ref().map(|t| t.unspliced.as_slice()),
+            decoy_end,
         );
         collapsed.update_eff_lengths(&eff_lengths);
         packed.refresh_combined(&collapsed);
@@ -2291,6 +2315,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
                 ref_bytes: &ref_bytes,
                 gc_store: &gc_store,
                 length_class: length_class.as_deref(),
+                exclude: splice_table.as_ref().map(|t| t.unspliced.as_slice()),
             };
             let (seq_obs, gc_obs, pos_obs) = match profile {
                 RadInputProfile::PiscemBulk => run_bias_pass::<PiscemBulkReadRecord>(
@@ -2334,6 +2359,8 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
                 opts.bias_speed_samp,
                 opts.no_bias_length_threshold,
                 bias_pos_stride.as_deref(),
+                splice_table.as_ref().map(|t| t.unspliced.as_slice()),
+                decoy_end,
             );
             collapsed.update_eff_lengths(&eff_lengths);
             packed.refresh_combined(&collapsed);

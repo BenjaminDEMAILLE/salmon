@@ -2017,6 +2017,15 @@ fn apply_bias_correction(
     // targets of an index built with `--unspliced`); `None` means 1 for all,
     // the exact computation.
     pos_stride: Option<&[usize]>,
+    // References left out of the expected bias models (unspliced targets):
+    // the models describe the library's protocol and are estimated on spliced
+    // targets, as with a gentrome index where intronic fragments go to the
+    // decoy; the correction is still applied to every target.
+    model_exclude: Option<&[bool]>,
+    // End of the decoy block: references in `[num_targets, decoy_end)` are
+    // decoys and are not swept; a tail after it (sub-k transcripts, projected
+    // unspliced targets) is. `num_refs` when there is no such tail.
+    decoy_end: usize,
 ) -> salmon_model::dumps::BiasDump {
     use salmon_model::seqbias::CONTEXT_LENGTH;
     let mut bias_dump = salmon_model::dumps::BiasDump::default();
@@ -2026,6 +2035,16 @@ fn apply_bias_correction(
     let k = if seq_bias { CONTEXT_LENGTH } else { 1 };
     let refseq_of = |t: usize| &ref_bytes[t];
     let stride_of = |t: usize| pos_stride.map_or(1, |s| s[t]);
+    // Abundances the expected models see: excluded targets weigh nothing.
+    let model_alphas: std::borrow::Cow<[f64]> = match model_exclude {
+        Some(ex) => alphas
+            .iter()
+            .zip(ex)
+            .map(|(&a, &x)| if x { 0.0 } else { a })
+            .collect::<Vec<f64>>()
+            .into(),
+        None => alphas.into(),
+    };
 
     let seq = seq_obs.map(|(mut of, mut or)| {
         of.normalize();
@@ -2034,7 +2053,7 @@ fn apply_bias_correction(
             num_targets,
             refseq_of,
             stride_of,
-            alphas,
+            &model_alphas,
             eff_lengths,
             &fld_cdf,
         );
@@ -2061,7 +2080,7 @@ fn apply_bias_correction(
             refseq_of,
             |t| gc_store.view(t),
             stride_of,
-            alphas,
+            &model_alphas,
             eff_lengths,
             &fld_cdf,
             fld_low,
@@ -2090,7 +2109,7 @@ fn apply_bias_correction(
         let (ef, er) = salmon_model::build_expected_pos(
             num_targets,
             |t| lengths[t] as usize,
-            alphas,
+            &model_alphas,
             eff_lengths,
             &fld_cdf,
             length_quantiles.expect("positional bias requires length quantiles"),
@@ -2119,7 +2138,7 @@ fn apply_bias_correction(
             // Decoys keep their uncorrected effective length: they are never
             // reported, so the corrected value would be unused, and computing
             // it is the #1019 stall. Same guard the one-pass path applies.
-            if tid >= num_targets || alphas[tid] < 1e-8 {
+            if (tid >= num_targets && tid < decoy_end) || alphas[tid] < 1e-8 {
                 return;
             }
             let s = &ref_bytes[tid];
@@ -2525,6 +2544,8 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
             opts.bias_speed_samp,
             opts.no_bias_length_threshold,
             None,
+            None,
+            num_refs,
         );
         collapsed.update_eff_lengths(&eff_lengths);
         // Only the combined weights changed; patch them in place.

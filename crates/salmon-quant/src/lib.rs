@@ -766,6 +766,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             ignore_incompat,
             collect_seqbias: opts.seq_bias,
             seqbias_obs: seqbias_obs.as_ref(),
+            bias_exclude: splice_table.as_ref().map(|t| t.unspliced.as_slice()),
             collect_gcbias: opts.gc_bias,
             cond_gc_bins: opts.cond_gc_bins,
             gc_bins: opts.gc_bins,
@@ -1135,6 +1136,26 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
         // contribute nothing, but a decoy chromosome would otherwise hand one
         // rayon worker an O(ref_len) sweep over hundreds of Mbp. See issue #1019.
         let num_targets = salmon.info().first_decoy_index.unwrap_or(num_refs);
+        // End of the decoy block. A tail after it (sub-k transcripts, projected
+        // unspliced targets) is quantified, so it is bias-corrected too; only
+        // the decoys themselves are skipped.
+        let decoy_end = match salmon.info().first_decoy_index {
+            Some(f) if salmon.info().num_decoys > 0 => f + salmon.info().num_decoys,
+            _ => num_refs,
+        };
+        // The expected models describe the library protocol and are estimated
+        // on spliced targets only (unspliced targets weigh nothing), matching
+        // the observed models (`Shared::bias_exclude`).
+        let model_alphas: std::borrow::Cow<[f64]> = match &splice_table {
+            Some(t) => em
+                .alphas
+                .iter()
+                .zip(&t.unspliced)
+                .map(|(&a, &u)| if u { 0.0 } else { a })
+                .collect::<Vec<f64>>()
+                .into(),
+            None => std::borrow::Cow::Borrowed(&em.alphas),
+        };
         let pmf_lin: Vec<f64> = log_pmf.iter().map(|lp| lp.exp()).collect();
         let (fld_cdf, fld_low, fld_high) = salmon_model::seqbias::fld_cdf_and_bounds(&pmf_lin);
         // K excludes the leading sequence context only when seq-correcting.
@@ -1153,7 +1174,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                 num_targets,
                 |t| salmon.ref_seq(t as u32),
                 bias_pos_stride,
-                &em.alphas,
+                &model_alphas,
                 &eff_lengths,
                 &fld_cdf,
             );
@@ -1184,7 +1205,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                 |t| salmon.ref_seq(t as u32),
                 |t| store.unwrap().view(t),
                 bias_pos_stride,
-                &em.alphas,
+                &model_alphas,
                 &eff_lengths,
                 &fld_cdf,
                 fld_low,
@@ -1218,7 +1239,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
             let (exp_fw, exp_rc) = salmon_model::build_expected_pos(
                 num_targets,
                 |t| salmon.ref_len(t) as usize,
-                &em.alphas,
+                &model_alphas,
                 &eff_lengths,
                 &fld_cdf,
                 length_quantiles.as_ref().unwrap(),
@@ -1272,7 +1293,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
                 // chromosome (up to ~250 Mb) then serializes the entire phase while
                 // the other worker threads sit idle. Mirrors PR #1020's exclusion of
                 // decoys from the expected bias models.
-                if tid >= num_targets || em.alphas[tid] < 1e-8 {
+                if (tid >= num_targets && tid < decoy_end) || em.alphas[tid] < 1e-8 {
                     return eff_lengths[tid];
                 }
                 let s = salmon.ref_seq(tid as u32);
