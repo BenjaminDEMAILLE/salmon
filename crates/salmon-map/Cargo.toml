@@ -12,8 +12,6 @@ description = "Selective-alignment mapping for the salmon Rust port: MEM collect
 salmon-core = { workspace = true }
 piscem-rs = { workspace = true }
 sshash-lib = "0.8"
-# reads sshash's bucket offsets (`BitFieldVec::index_value`) for the GPU lookup
-value-traits = "0.3"
 rayon = { workspace = true }
 ahash = { workspace = true }
 hashbrown = { workspace = true }

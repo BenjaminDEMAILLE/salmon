@@ -74,22 +74,24 @@ pub struct SshashParts<'i> {
 
 /// `None` when the offsets do not fit `u32`.
 pub fn sshash_parts(index: &ReferenceIndex) -> Option<SshashParts<'_>> {
-    use value_traits::slices::SliceByValue;
     let dict = index.dict();
     let (spss, sk) = (dict.spss(), dict.index_ref());
     use rayon::prelude::*;
-    let n = sk.offsets.len();
     // random access into sshash's compressed arrays: parallel, as this runs
     // while the CPU maps the first batches
-    let ef = &sk.num_super_kmers_before_bucket;
-    let mut bstart = (0..sk.num_buckets())
+    let spans: Vec<_> = (0..sk.num_buckets())
         .into_par_iter()
-        .map(|b| u32::try_from(ef.access(b) as usize + b).ok())
-        .collect::<Option<Vec<_>>>()?;
-    bstart.push(u32::try_from(n).ok()?);
-    let offs = (0..n)
-        .into_par_iter()
-        .map(|i| u32::try_from(sk.offsets.index_value(i)).ok())
+        .map(|b| sk.bucket(b))
+        .collect();
+    let mut bstart = Vec::with_capacity(spans.len() + 1);
+    bstart.push(0u32);
+    for s in &spans {
+        bstart.push(bstart.last()?.checked_add(u32::try_from(s.len()).ok()?)?);
+    }
+    let offs = spans
+        .par_iter()
+        .flat_map_iter(|&s| (0..s.len()).map(move |i| sk.bucket_offset(s, i)))
+        .map(|v| u32::try_from(v).ok())
         .collect::<Option<_>>()?;
     Some(SshashParts {
         m: dict.m(),
