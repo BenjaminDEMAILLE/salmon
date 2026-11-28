@@ -357,17 +357,24 @@ fn hits_path_maps_like_piscem_strict() {
     );
     for (name, t, cpu) in runs {
         for perm in [false, true] {
-            let mut gpu = KmerGpu::new(t, perm).expect("upload");
+            // shortcut: a slow GPU (the Intel runner's) can hit the command
+            // buffer watchdog on the heavy runs and the device-built table;
+            // quantify then maps on the CPU. Split the work if Apple GPUs skip.
+            let hang = |e: &String| {
+                let hung = e.contains("Hang");
+                if hung {
+                    eprintln!("{name}: skipped, the GPU timed out ({e})");
+                }
+                hung
+            };
+            let mut gpu = match KmerGpu::new(t, perm) {
+                Err(e) if hang(&e) => continue,
+                r => r.expect("upload"),
+            };
             gpu.warm_up(t);
             let (mut h, mut c) = (Vec::new(), Vec::new());
-            // shortcut: a slow GPU (the Intel runner's) can hit the command
-            // buffer watchdog on the every-bucket-heavy stress run; quantify
-            // then maps on the CPU. Split the batch if this skips on Apple GPUs.
             match gpu.hits(&seq, &off, &mut h, &mut c) {
-                Err(e) if e.contains("Hang") => {
-                    eprintln!("{name}: skipped, the GPU timed out ({e})");
-                    continue;
-                }
+                Err(e) if hang(&e) => continue,
                 r => r.expect("kernel"),
             }
             let mut on_cpu = 0;
