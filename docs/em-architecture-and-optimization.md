@@ -1029,11 +1029,7 @@ every pair, with identical equivalence classes and `quant.sf`. Most of what
 remains is waiting on the device, which runs about two command buffers at a
 time but is not saturated: dispatching the k-mer kernel twice per batch
 doubles the device's busy time and leaves the mapping phase unchanged. The
-wait is each batch's latency. Hiding it with more threads than cores buys
-little: the fastest of 3 alternated runs is 8.48 s at `-p 16`, 8.27 s at 24
-and 8.13 s at 32, close to the 7.9 s the read-ahead threads take to read and
-parse the pairs, so overlapping a batch's GPU work with the mapping of
-another was not pursued.
+wait is each batch's latency, which a faster kernel would not shorten.
 
 **Heavy buckets.** The first GPU run on this data did not finish in 10
 minutes. The kernel scanned every super-k-mer of the minimizer's bucket, while
