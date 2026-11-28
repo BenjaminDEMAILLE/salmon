@@ -406,7 +406,7 @@ fn accept(tid: u32, target: &SketchHitInfoSimple, nvh: u32, out: &mut Vec<Simple
 
 /// [`crate::map_single_read_sketch_into`] from the read's raw hits (found with
 /// the same skipping strategy); `false` (and `result` untouched) when the CPU
-/// must map it. `unitig_base` as in [`project`] (`&[]` reads sshash's).
+/// must map it. `unitig_base` as in `project` (`&[]` reads sshash's).
 #[allow(clippy::too_many_arguments)]
 pub fn map_single_read_hits_into(
     result: &mut Vec<ScoredMapping>,
@@ -511,7 +511,7 @@ pub fn map_read_pair_selected_into<R: RefProvider>(
 
 /// [`crate::map_read_pair_sketch_into`] from each mate's raw hits (found with
 /// the same skipping strategy); `false` (and `result` untouched) when the CPU
-/// must map it. `unitig_base` as in [`project`] (`&[]` reads sshash's).
+/// must map it. `unitig_base` as in `project` (`&[]` reads sshash's).
 #[allow(clippy::too_many_arguments)]
 pub fn map_read_pair_hits_into<R: RefProvider>(
     result: &mut Vec<ScoredMapping>,

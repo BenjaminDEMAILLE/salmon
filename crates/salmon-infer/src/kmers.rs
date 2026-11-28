@@ -776,7 +776,7 @@ impl KmerTable {
 
     /// The raw hits of `read`, appended to `out`, as piscem's `Permissive`
     /// (`permissive`) or `Strict` skipping finds them: the CPU reference of the
-    /// GPU kernel ([`KMER_BODY`]), which computes the same in one loop.
+    /// GPU kernel (`KMER_BODY`), which computes the same in one loop.
     pub fn hits(&self, read: &[u8], permissive: bool, out: &mut Vec<Hit>) {
         let k = self.k as i32;
         let len = read.len() as i32;
